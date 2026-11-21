@@ -60,6 +60,11 @@ dev = [
 [project.scripts]
 glare-remove = "eyeglass_glare_removal.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/anubhavmalhotra/eyeglass-glare-removal"
+Repository = "https://github.com/anubhavmalhotra/eyeglass-glare-removal"
+Issues = "https://github.com/anubhavmalhotra/eyeglass-glare-removal/issues"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

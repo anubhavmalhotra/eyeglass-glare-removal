@@ -72,7 +72,7 @@ Input Video (portrait / landscape / square, rotated or VFR, with or without audi
 ### Install Package
 
 ```bash
-git clone <repo-url> eyeglass-glare-removal
+git clone https://github.com/anubhavmalhotra/eyeglass-glare-removal.git
 cd eyeglass-glare-removal
 
 # Core package (PyTorch, Diffusers, Transformers, OpenCV, SciPy, Pillow)
