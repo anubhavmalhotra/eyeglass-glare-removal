@@ -580,3 +580,128 @@ def test_contour_protection_reaches_inner_half_of_metallic_rim_next_to_neutral_g
     alpha, _ = composite.compute_rim_safe_alpha(original, clean, lens, lens, bevel_band_px=bevel)
     assert float(np.median(alpha[rim & (lens > 0)])) < 0.15
     assert float(np.median(alpha[radius < 26])) > 0.95
+
+
+@pytest.mark.parametrize("use_dir_fd", [True, False])
+def test_png_export_mode_0600_windows_fallback_shorter_rerender_and_case_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_dir_fd: bool
+) -> None:
+    """Regressions P0 #5, P0 #3, P1 #9, P1 #10: mode 0600, Windows fallback, trailing PNG retirement, case-alias symlink rejection."""
+    import os
+    import stat as stat_mod
+
+    from eyeglass_glare_removal import _workspace
+
+    if not use_dir_fd:
+        monkeypatch.setattr(_workspace, "_supports_dir_fd", lambda: False)
+
+    work = tmp_path / "work"
+    frames, cleaned, masks, exports = (work / p for p in ("frames", "cleaned", "masks", "exports"))
+    for d in (frames, cleaned, masks, exports):
+        d.mkdir(parents=True)
+
+    # Prior 2-frame export + unrelated file in exports/
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(exports / "000000.png")
+    Image.new("RGB", (32, 32), (40, 50, 60)).save(exports / "000001.png")
+    (exports / "notes.txt").write_text("keep me", encoding="utf-8")
+
+    # New shorter 1-frame render
+    Image.new("RGB", (32, 32), (90, 100, 110)).save(frames / "000000.png")
+    roi_meta = {
+        "fps": 24,
+        "full_width": 32,
+        "full_height": 32,
+        "frames": [{"frame_idx": 0, "filename": "000000.png", "x1": 0, "y1": 0, "x2": 32, "y2": 32}],
+    }
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"old_mp4")
+
+    class _Pipe:
+        def __init__(self, p: Path):
+            self.p = p
+            self.stdin = io.BytesIO()
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(composite, "open_video_writer_pipe", lambda *a, **_k: _Pipe(a[3]))
+    monkeypatch.setattr(
+        composite, "close_video_writer_pipe", lambda pipe, _lbl="video": pipe.p.write_bytes(b"new_mp4")
+    )
+
+    # 1) Rollback during shorter rerender MUST restore stale 000001.png along with 000000.png & out.mp4!
+    real_replace = os.replace
+    old_0001 = (exports / "000001.png").read_bytes()
+
+    def fail_on_retire(src, dst, **kwargs):
+        if Path(str(src)).name == "000001.png":
+            raise OSError("simulated retire failure")
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_on_retire)
+    with pytest.raises(OSError, match="simulated retire failure"):
+        composite.run_composite_stage(
+            orig_frames_dir=frames,
+            cleaned_roi_dir=cleaned,
+            lens_masks_dir=masks,
+            roi_meta=roi_meta,
+            output_mp4=out,
+            config=CompositeConfig(save_frames_dir=exports, workers=1),
+            frame_has_edit=[False],
+            workspace_root=work,
+        )
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert out.read_bytes() == b"old_mp4"
+    assert (exports / "000001.png").read_bytes() == old_0001
+    assert (exports / "notes.txt").read_text(encoding="utf-8") == "keep me"
+
+    # 2) Successful shorter rerender: 000000.png has mode 0600, stale 000001.png removed, notes.txt preserved!
+    composite.run_composite_stage(
+        orig_frames_dir=frames,
+        cleaned_roi_dir=cleaned,
+        lens_masks_dir=masks,
+        roi_meta=roi_meta,
+        output_mp4=out,
+        config=CompositeConfig(save_frames_dir=exports, workers=1),
+        frame_has_edit=[False],
+        workspace_root=work,
+    )
+    assert out.read_bytes() == b"new_mp4"
+    assert (exports / "000000.png").exists()
+    assert not (exports / "000001.png").exists()
+    assert (exports / "notes.txt").read_text(encoding="utf-8") == "keep me"
+    assert not list(exports.glob(".*"))
+    if os.name == "posix":
+        mode = stat_mod.S_IMODE((exports / "000000.png").stat().st_mode)
+        assert mode == 0o600
+
+    # 3) Symlinked ancestor under case-aliased workspace root (`WORK/link/exports`) MUST be rejected!
+    outside = tmp_path / "outside_dir"
+    (outside / "sub").mkdir(parents=True)
+    link = work / "link"
+    link.symlink_to(outside, target_is_directory=True)
+    case_aliased_export = tmp_path / "WORK" / "link" / "sub"
+    if (tmp_path / "WORK").exists():  # macOS / case-insensitive FS
+        with pytest.raises(ValueError, match="Symlinked"):
+            composite.run_composite_stage(
+                orig_frames_dir=frames,
+                cleaned_roi_dir=cleaned,
+                lens_masks_dir=masks,
+                roi_meta=roi_meta,
+                output_mp4=out,
+                config=CompositeConfig(save_frames_dir=case_aliased_export, workers=1),
+                frame_has_edit=[False],
+                workspace_root=work,
+            )
+    # Also verify non-case-aliased symlinked ancestor is rejected in BOTH dir_fd and Windows fallback modes
+    with pytest.raises(ValueError, match="Symlinked"):
+        composite.run_composite_stage(
+            orig_frames_dir=frames,
+            cleaned_roi_dir=cleaned,
+            lens_masks_dir=masks,
+            roi_meta=roi_meta,
+            output_mp4=out,
+            config=CompositeConfig(save_frames_dir=work / "link" / "sub", workers=1),
+            frame_has_edit=[False],
+            workspace_root=work,
+        )

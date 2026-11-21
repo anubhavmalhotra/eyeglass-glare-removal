@@ -179,3 +179,30 @@ def test_pipeline_protects_published_destinations_inside_replaceable_stages(
             input_path=source, work_dir=work, output_path=output,
             composite=CompositeConfig(save_frames_dir=stage_dir / "frames"),
         )
+
+
+def test_pipeline_rejects_case_aliased_stage_destinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression P0 #3: case aliases (WORK/PREP/out.mp4) cannot bypass replaceable stage guard."""
+    from eyeglass_glare_removal import _workspace
+
+    work = tmp_path / "work"
+    (work / "prep").mkdir(parents=True)
+    source = tmp_path / "source.mp4"
+
+    # Case-insensitive filesystem check (always active on macOS APFS, simulated on Linux ext4 too)
+    monkeypatch.setattr(_workspace, "_dir_is_case_insensitive", lambda _p: True)
+    with pytest.raises(ValueError, match="replaceable stage"):
+        PipelineConfig(
+            input_path=source,
+            work_dir=work,
+            output_path=tmp_path / "WORK" / "PREP" / "out.mp4",
+        )
+    # Also before the stage subdir exists on disk (e.g. masks not yet created)
+    with pytest.raises(ValueError, match="replaceable stage"):
+        PipelineConfig(
+            input_path=source,
+            work_dir=work,
+            output_path=tmp_path / "WORK" / "MASKS" / "out.mp4",
+        )

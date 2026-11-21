@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from eyeglass_glare_removal._workspace import assert_distinct_output_paths
+from eyeglass_glare_removal._workspace import assert_distinct_output_paths, path_is_under_dir
 
 DEFAULT_PROMPT = (
     "Close-up natural video of a person wearing eyeglasses, with clear, sharp, natural eyes "
@@ -373,8 +373,7 @@ class PipelineConfig:
                 continue
             for stage in ("prep", "masks", "reference", "inpaint"):
                 managed = self.work_dir / stage
-                if (
-                    destination.absolute().is_relative_to(managed.absolute())
-                    or destination.resolve().is_relative_to(managed.resolve())
-                ):
-                    raise ValueError(f"Published destination ({destination}) is inside replaceable stage ({managed}).")
+                if path_is_under_dir(destination, managed):
+                    raise ValueError(
+                        f"Published destination ({destination}) is inside replaceable stage ({managed})."
+                    )

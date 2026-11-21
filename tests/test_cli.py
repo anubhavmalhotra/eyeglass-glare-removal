@@ -685,3 +685,101 @@ def test_composite_rejects_non_boolean_edit_flags_with_valid_digests(
     layout.edit_support_json.write_text(json.dumps(edit_support))
     with pytest.raises(ValueError, match="frame_has_edit"):
         verify_inpaint_artifacts(*args)
+
+
+def test_atomic_commit_rejects_file_replacing_directory_and_vice_versa(tmp_path: Path) -> None:
+    """Regression P0 #1: publishing a file must NEVER replace or delete an existing directory."""
+    from eyeglass_glare_removal._workspace import atomic_commit_paths, make_unique_temp_sibling
+
+    # 1) Regular file staged -> existing non-empty directory destination: MUST raise & keep directory intact!
+    existing_dir = tmp_path / "out.mp4"
+    existing_dir.mkdir()
+    precious = existing_dir / "keep_me.txt"
+    precious.write_text("DO_NOT_DELETE", encoding="utf-8")
+
+    staged_file = tmp_path / ".staged_out.tmp"
+    staged_file.write_bytes(b"new_mp4_bytes")
+
+    with pytest.raises(ValueError, match="non-regular destination"):
+        atomic_commit_paths([(staged_file, existing_dir)])
+    assert existing_dir.is_dir()
+    assert precious.read_text(encoding="utf-8") == "DO_NOT_DELETE"
+    assert staged_file.exists()
+
+    with pytest.raises(ValueError, match="existing directory"):
+        make_unique_temp_sibling(existing_dir)
+
+    # 2) Staged directory -> existing regular file destination: MUST raise & keep file intact!
+    existing_file = tmp_path / "regular_file.txt"
+    existing_file.write_text("ORIGINAL_FILE", encoding="utf-8")
+    staged_dir = tmp_path / ".staged_dir"
+    staged_dir.mkdir()
+    (staged_dir / "child.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-directory destination"):
+        atomic_commit_paths([(staged_dir, existing_file)])
+    assert existing_file.is_file()
+    assert existing_file.read_text(encoding="utf-8") == "ORIGINAL_FILE"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"init_frame_idx": None},
+        {"init_frame_idx": True},
+        {"init_frame_idx": 5},
+        {"video_metadata": {"colorspace": ["bt709"]}},
+        {"video_metadata": {"color_primaries": 709}},
+        {"video_metadata": {"sar": ["1:1"]}},
+        {"init_eye_geometry_roi": {"left_eye": "bad"}},
+    ],
+)
+def test_prep_resume_invalidates_malformed_seed_and_video_metadata_fields(
+    tmp_path: Path, mutation: dict[str, object]
+) -> None:
+    """Regression P1 #5: malformed init_frame_idx or non-string video_metadata fields invalidate prep resume."""
+    inp = tmp_path / "clip.mp4"
+    inp.write_bytes(b"bytes")
+    work = tmp_path / "work"
+    layout = WorkDirLayout(work)
+    layout.frames_dir.mkdir(parents=True)
+    layout.roi_frames_dir.mkdir(parents=True)
+    Image.new("RGB", (160, 120), (80, 80, 80)).save(layout.frames_dir / "000000.png")
+    Image.new("RGB", (64, 64), (90, 90, 90)).save(layout.roi_frames_dir / "000000.png")
+
+    prep_cfg = PrepConfig(roi_size=64)
+    src_sha = hash_file_sha256(inp)
+    roi_meta = {
+        "source_video": str(inp.resolve()),
+        "source_sha256": src_sha,
+        "prep_generation": compute_prep_generation(src_sha, prep_cfg),
+        "frames_digest": hash_files_manifest(layout.frames_dir, ["000000.png"]),
+        "roi_frames_digest": hash_files_manifest(layout.roi_frames_dir, ["000000.png"]),
+        "audio_sha256": None,
+        "audio_filename": None,
+        "fps": 30.0,
+        "detector": "haar",
+        "crop_size": 64,
+        "full_width": 160,
+        "full_height": 120,
+        "roi_size": 64,
+        "num_frames": 1,
+        "init_frame_idx": 0,
+        "init_eye_geometry_roi": None,
+        "video_metadata": {"colorspace": "bt709"},
+        "frames": [{"frame_idx": 0, "filename": "000000.png", "x1": 0, "y1": 0, "x2": 64, "y2": 64}],
+    }
+    cfg = PipelineConfig(
+        input_path=inp,
+        output_path=tmp_path / "out.mp4",
+        work_dir=work,
+        prep=prep_cfg,
+        reference=cli.ReferenceConfig(roi_size=64),
+    )
+    layout.roi_boxes_json.write_text(json.dumps(roi_meta), encoding="utf-8")
+    assert _prep_matches_config(layout, cfg) is not None
+
+    bad_meta = dict(roi_meta)
+    bad_meta.update(mutation)
+    layout.roi_boxes_json.write_text(json.dumps(bad_meta), encoding="utf-8")
+    assert _prep_matches_config(layout, cfg) is None

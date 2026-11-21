@@ -162,6 +162,25 @@ def _extract_safe_filenames(meta: dict[str, Any], label: str) -> list[str]:
         or not isinstance(meta.get("detector"), str)
     ):
         raise ValueError(f"Invalid video properties in {label}")
+    if "init_frame_idx" in meta:
+        raw_seed = meta["init_frame_idx"]
+        if type(raw_seed) is not int or not (0 <= raw_seed < raw_n):
+            raise ValueError(f"Invalid init_frame_idx in {label}: {raw_seed!r}")
+
+    eye_geom = meta.get("init_eye_geometry_roi")
+    if eye_geom is not None:
+        if not isinstance(eye_geom, dict):
+            raise ValueError(f"Invalid init_eye_geometry_roi in {label}")
+        for pt_key in ("left_eye", "right_eye", "bridge"):
+            pt = eye_geom.get(pt_key)
+            if pt is not None:
+                if (
+                    not isinstance(pt, (list, tuple))
+                    or len(pt) != 2
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in pt)
+                ):
+                    raise ValueError(f"Invalid init_eye_geometry_roi.{pt_key} in {label}: {pt!r}")
+
     video_metadata = meta.get("video_metadata")
     audio_offset = meta.get("audio_offset_sec")
     if (video_metadata is not None and not isinstance(video_metadata, dict)) or (
@@ -169,6 +188,22 @@ def _extract_safe_filenames(meta: dict[str, Any], label: str) -> list[str]:
         and (type(audio_offset) not in (int, float) or not math.isfinite(audio_offset))
     ):
         raise ValueError(f"Invalid media metadata in {label}")
+    if isinstance(video_metadata, dict):
+        str_fields = (
+            "sample_aspect_ratio",
+            "sar",
+            "color_primaries",
+            "color_trc",
+            "colorspace",
+            "color_range",
+            "pix_fmt",
+            "video_codec",
+            "audio_codec",
+        )
+        for key in str_fields:
+            val = video_metadata.get(key)
+            if val is not None and not isinstance(val, str):
+                raise ValueError(f"Invalid video_metadata.{key} in {label}: {val!r}")
     filenames: list[str] = []
     for i, rec in enumerate(frames):
         if not isinstance(rec, dict) or not isinstance(rec.get("filename"), str):

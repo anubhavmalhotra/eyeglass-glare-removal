@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -16,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from eyeglass_glare_removal._workspace import (
+    ExportDirectoryHandle,
     assert_distinct_output_paths,
     assert_source_outside_managed_dir,
     atomic_commit_paths,
@@ -23,8 +25,11 @@ from eyeglass_glare_removal._workspace import (
     hash_file_sha256,
     make_unique_temp_sibling,
     open_export_directory,
+    path_is_under_dir,
+    paths_alias,
     reject_symlink_components_under,
     reject_symlink_path,
+    relative_to_anchor,
     validate_safe_basename,
 )
 from eyeglass_glare_removal.config import CompositeConfig
@@ -715,7 +720,7 @@ def run_composite_stage(
     if save_dir is not None:
         save_anchor = (
             workspace_root
-            if workspace_root is not None and save_dir.absolute().is_relative_to(workspace_root.absolute())
+            if workspace_root is not None and relative_to_anchor(workspace_root, save_dir) is not None
             else None
         )
         if save_anchor is not None:
@@ -725,7 +730,9 @@ def run_composite_stage(
         for source in sources:
             assert_source_outside_managed_dir(source, save_dir)
         for in_dir in (orig_dir, clean_dir, masks_dir, glare_dir):
-            if in_dir is not None and save_dir.resolve() == in_dir.resolve():
+            if in_dir is not None and (
+                paths_alias(save_dir, in_dir) or path_is_under_dir(save_dir, in_dir)
+            ):
                 raise ValueError(
                     f"save_frames_dir ({save_dir}) must not collide with input stage directory ({in_dir})."
                 )
@@ -754,7 +761,7 @@ def run_composite_stage(
 
     tmp_main = tmp_cmp = tmp_qa = None
     proc_main = proc_cmp = None
-    export_fd: int | None = None
+    export_handle: ExportDirectoryHandle | None = None
 
     eff_bs = compute_effective_batch_size(
         full_w,
@@ -814,11 +821,12 @@ def run_composite_stage(
                 rim_protect_strength=config.rim_protect_strength,
             )
 
-        if export_fd is not None:
+        if export_handle is not None:
             staged, _ = export_pairs[fn]
-            fd = os.open(staged.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=export_fd)
-            with os.fdopen(fd, "wb") as frame_file:
-                Image.fromarray(comp_rgb).save(frame_file, format="PNG")
+            export_handle.write_private_file(
+                staged.name,
+                lambda frame_file: Image.fromarray(comp_rgb).save(frame_file, format="PNG"),
+            )
 
         cmp_rgb = (
             build_compare_frame(orig_rgb, comp_rgb, box, i, fps) if proc_cmp is not None else None
@@ -844,7 +852,7 @@ def run_composite_stage(
     resources = ExitStack()
     try:
         if save_dir is not None:
-            export_fd = resources.enter_context(open_export_directory(save_dir, workspace_root))
+            export_handle = resources.enter_context(open_export_directory(save_dir, workspace_root))
         tmp_main = make_unique_temp_sibling(output_mp4)
         if resolved_compare is not None:
             tmp_cmp = make_unique_temp_sibling(resolved_compare)
@@ -911,14 +919,25 @@ def run_composite_stage(
             tmp_qa = make_unique_temp_sibling(resolved_qa_grid)
             build_compare_qa_grid(orig_zooms, comp_zooms, tmp_qa)
             publish_pairs.append((tmp_qa, resolved_qa_grid))
-        directory_fds = None
+        directory_fds: dict[Path, int] | None = None
+        retire_paths: list[Path] = []
         if save_dir is not None:
-            assert export_fd is not None
-            with open_export_directory(save_dir, workspace_root) as current_fd:
-                if not os.path.samestat(os.fstat(export_fd), os.fstat(current_fd)):
-                    raise ValueError("PNG export directory changed during rendering.")
-            directory_fds = {save_dir: export_fd}
-        atomic_commit_paths(publish_pairs + list(export_pairs.values()), directory_fds=directory_fds)
+            assert export_handle is not None
+            export_handle.verify_unchanged(workspace_root)
+            if export_handle.fd is not None:
+                directory_fds = {save_dir: export_handle.fd}
+            # Retire stale trailing numeric frame PNGs (e.g. 000001.png from a longer prior run)
+            # inside the same commit transaction without touching unrelated non-frame files.
+            exported_names = set(filenames)
+            frame_seq_re = re.compile(r"^\d{6}\.png$")
+            for existing_name in export_handle.list_regular_filenames():
+                if existing_name not in exported_names and frame_seq_re.match(existing_name):
+                    retire_paths.append(save_dir / existing_name)
+        atomic_commit_paths(
+            publish_pairs + list(export_pairs.values()),
+            directory_fds=directory_fds,
+            retire_paths=retire_paths,
+        )
 
         return {
             "output_mp4": str(output_mp4),
@@ -941,11 +960,8 @@ def run_composite_stage(
             for temp_path in (tmp_main, tmp_cmp, tmp_qa):
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
-            if export_fd is not None:
+            if export_handle is not None:
                 for staged, _ in export_pairs.values():
-                    try:
-                        os.unlink(staged.name, dir_fd=export_fd)
-                    except FileNotFoundError:
-                        pass
+                    export_handle.unlink_if_exists(staged.name)
         finally:
             resources.close()
