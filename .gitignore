@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Runtime artifacts & media (never commit user videos/frames/checkpoints)
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4a
+*.wav
+*.aac
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.npz
+*.pt
+*.pth
+*.safetensors
+*.lock
+work/
+*.work/
+output/
+outputs/
