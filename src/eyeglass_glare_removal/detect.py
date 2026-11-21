@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter1d
 
 from eyeglass_glare_removal._workspace import (
+    assert_source_outside_managed_dir,
     atomic_swap_directory,
     atomic_write_text,
     ensure_confined_dir,
@@ -32,7 +33,7 @@ from eyeglass_glare_removal._workspace import (
     validate_safe_basename,
 )
 from eyeglass_glare_removal.config import PrepConfig
-from eyeglass_glare_removal.media import extract_cfr_frames
+from eyeglass_glare_removal.media import compute_audio_offset_sec, extract_cfr_frames
 
 logger = logging.getLogger(__name__)
 
@@ -746,161 +747,173 @@ def run_prep_stage(
     config: PrepConfig,
 ) -> dict[str, Any]:
     """
-    Execute Stage 1 end-to-end with content hashing, symlink confinement, and atomic staging.
+    Execute Stage 1 end-to-end with source confinement guard, canonical source path
+    recording, content hashing, and single-generation atomic staging.
     """
     source_path = Path(source_video)
     if not source_path.exists():
         raise FileNotFoundError(f"Input video not found: {source_path}")
-    source_sha256 = hash_file_sha256(source_path)
-    prep_gen = compute_prep_generation(source_sha256, config)
+    canonical_source = source_path.resolve(strict=True)
 
     prep_dir = Path(prep_dir)
     reject_symlink_path(prep_dir, "prep_dir")
-    prep_dir.mkdir(parents=True, exist_ok=True)
+    # Guard against source aliasing or residing inside prep_dir BEFORE any write or unlink
+    assert_source_outside_managed_dir(canonical_source, prep_dir)
 
-    frame_paths, audio_path, meta, fps = extract_cfr_frames(
-        source_path,
-        prep_dir,
-        start_sec=config.start_sec,
-        duration_sec=config.duration_sec,
-        target_fps=config.fps,
-    )
-    img0 = cv2.imread(str(frame_paths[0]))
-    if img0 is None:
-        raise RuntimeError(f"Failed to read extracted frame: {frame_paths[0]}")
-    H, W = img0.shape[:2]
-    n_frames = len(frame_paths)
+    source_sha256 = hash_file_sha256(canonical_source)
+    prep_gen = compute_prep_generation(source_sha256, config)
 
-    init_idx, init_geom = find_initial_eye_geometry(frame_paths, config)
-
-    if config.roi_box is not None and config.crop_size is None:
-        bx1, by1, bx2, by2 = config.roi_box
-        user_side = max(bx2 - bx1, by2 - by1)
-        crop_size = compute_adaptive_crop_size(
-            init_geom.inter_ocular_px, W, H, explicit_crop_size=user_side
-        )
-    else:
-        crop_size = compute_adaptive_crop_size(
-            init_geom.inter_ocular_px, W, H, explicit_crop_size=config.crop_size
-        )
-
-    def _load_frame(i: int) -> np.ndarray:
-        im = cv2.imread(str(frame_paths[i]))
-        if im is None:
-            raise RuntimeError(f"Failed to read frame {frame_paths[i]}")
-        return im
-
-    redetect_fn = (
-        None
-        if config.detector == "manual" or config.roi_box is not None
-        else (lambda bgr: detect_eye_geometry(bgr, detector=config.detector))
-    )
-
-    raw_c, sm_c, ncc, redetected = track_roi_centers(
-        _load_frame,
-        n_frames,
-        init_geom,
-        init_idx=init_idx,
-        smooth_sigma=config.smooth_sigma,
-        ncc_redetect_threshold=config.ncc_redetect_threshold,
-        redetect_fn=redetect_fn,
-    )
-
-    roi_dir = ensure_confined_dir(prep_dir, prep_dir / "roi_frames", create=False)
-    stage_roi_dir = make_unique_temp_dir(prep_dir, prefix=".stage_roi_frames_")
-
-    frame_records: list[dict[str, Any]] = []
-    work_items: list[tuple[Path, Path, tuple[int, int, int, int]]] = []
-    filenames: list[str] = []
-    for i, fp in enumerate(frame_paths):
-        fn = validate_safe_basename(fp.name)
-        filenames.append(fn)
-        box = make_roi_box(float(sm_c[i, 0]), float(sm_c[i, 1]), crop_size, W, H)
-        work_items.append((fp, stage_roi_dir / fn, box))
-        frame_records.append(
-            {
-                "frame_idx": i,
-                "filename": fn,
-                "x1": box[0],
-                "y1": box[1],
-                "x2": box[2],
-                "y2": box[3],
-                "raw_cx": round(float(raw_c[i, 0]), 2),
-                "raw_cy": round(float(raw_c[i, 1]), 2),
-                "smooth_cx": round(float(sm_c[i, 0]), 2),
-                "smooth_cy": round(float(sm_c[i, 1]), 2),
-                "track_ncc": round(float(ncc[i]), 4),
-                "redetected": bool(redetected[i]),
-            }
-        )
-
-    def _save_roi(item: tuple[Path, Path, tuple[int, int, int, int]]) -> None:
-        src_p, dst_p, (x1, y1, x2, y2) = item
-        bgr = cv2.imread(str(src_p))
-        if bgr is None:
-            raise RuntimeError(f"Failed to read frame during ROI export: {src_p}")
-        crop = bgr[y1:y2, x1:x2]
-        roi = cv2.resize(crop, (config.roi_size, config.roi_size), interpolation=cv2.INTER_LANCZOS4)
-        cv2.imwrite(str(dst_p), roi)
+    # Stage all prep outputs into a unique sibling dir and atomically commit prep_dir as one generation!
+    prep_dir.parent.mkdir(parents=True, exist_ok=True)
+    reject_symlink_path(prep_dir.parent, "workspace root")
+    stage_prep = make_unique_temp_dir(prep_dir.parent, prefix=f".stage_{prep_dir.name}_")
 
     try:
+        frame_paths, audio_path, meta, fps = extract_cfr_frames(
+            canonical_source,
+            stage_prep,
+            start_sec=config.start_sec,
+            duration_sec=config.duration_sec,
+            target_fps=config.fps,
+        )
+        img0 = cv2.imread(str(frame_paths[0]))
+        if img0 is None:
+            raise RuntimeError(f"Failed to read extracted frame: {frame_paths[0]}")
+        H, W = img0.shape[:2]
+        n_frames = len(frame_paths)
+
+        init_idx, init_geom = find_initial_eye_geometry(frame_paths, config)
+
+        if config.roi_box is not None and config.crop_size is None:
+            bx1, by1, bx2, by2 = config.roi_box
+            user_side = max(bx2 - bx1, by2 - by1)
+            crop_size = compute_adaptive_crop_size(
+                init_geom.inter_ocular_px, W, H, explicit_crop_size=user_side
+            )
+        else:
+            crop_size = compute_adaptive_crop_size(
+                init_geom.inter_ocular_px, W, H, explicit_crop_size=config.crop_size
+            )
+
+        def _load_frame(i: int) -> np.ndarray:
+            im = cv2.imread(str(frame_paths[i]))
+            if im is None:
+                raise RuntimeError(f"Failed to read frame {frame_paths[i]}")
+            return im
+
+        redetect_fn = (
+            None
+            if config.detector == "manual" or config.roi_box is not None
+            else (lambda bgr: detect_eye_geometry(bgr, detector=config.detector))
+        )
+
+        raw_c, sm_c, ncc, redetected = track_roi_centers(
+            _load_frame,
+            n_frames,
+            init_geom,
+            init_idx=init_idx,
+            smooth_sigma=config.smooth_sigma,
+            ncc_redetect_threshold=config.ncc_redetect_threshold,
+            redetect_fn=redetect_fn,
+        )
+
+        roi_dir = ensure_confined_dir(stage_prep, stage_prep / "roi_frames", create=True)
+        frame_records: list[dict[str, Any]] = []
+        work_items: list[tuple[Path, Path, tuple[int, int, int, int]]] = []
+        filenames: list[str] = []
+        for i, fp in enumerate(frame_paths):
+            fn = validate_safe_basename(fp.name)
+            filenames.append(fn)
+            box = make_roi_box(float(sm_c[i, 0]), float(sm_c[i, 1]), crop_size, W, H)
+            work_items.append((fp, roi_dir / fn, box))
+            frame_records.append(
+                {
+                    "frame_idx": i,
+                    "filename": fn,
+                    "x1": box[0],
+                    "y1": box[1],
+                    "x2": box[2],
+                    "y2": box[3],
+                    "raw_cx": round(float(raw_c[i, 0]), 2),
+                    "raw_cy": round(float(raw_c[i, 1]), 2),
+                    "smooth_cx": round(float(sm_c[i, 0]), 2),
+                    "smooth_cy": round(float(sm_c[i, 1]), 2),
+                    "track_ncc": round(float(ncc[i]), 4),
+                    "redetected": bool(redetected[i]),
+                }
+            )
+
+        def _save_roi(item: tuple[Path, Path, tuple[int, int, int, int]]) -> None:
+            src_p, dst_p, (x1, y1, x2, y2) = item
+            bgr = cv2.imread(str(src_p))
+            if bgr is None:
+                raise RuntimeError(f"Failed to read frame during ROI export: {src_p}")
+            crop = bgr[y1:y2, x1:x2]
+            roi = cv2.resize(
+                crop, (config.roi_size, config.roi_size), interpolation=cv2.INTER_LANCZOS4
+            )
+            cv2.imwrite(str(dst_p), roi)
+
         with ThreadPoolExecutor(max_workers=config.workers) as ex:
             list(ex.map(_save_roi, work_items))
-        atomic_swap_directory(stage_roi_dir, roi_dir)
-    except Exception:
-        if stage_roi_dir.exists():
-            shutil.rmtree(stage_roi_dir, ignore_errors=True)
+
+        seed_rec = frame_records[init_idx]
+        box_seed = (seed_rec["x1"], seed_rec["y1"], seed_rec["x2"], seed_rec["y2"])
+        eye_geom_roi_seed = init_geom.project_to_roi(box_seed, config.roi_size, shift=(0.0, 0.0))
+
+        frames_dir = stage_prep / "frames"
+        frames_digest = hash_files_manifest(frames_dir, filenames)
+        roi_frames_digest = hash_files_manifest(roi_dir, filenames)
+        audio_sha256 = hash_file_sha256(audio_path) if audio_path is not None else None
+        audio_offset = compute_audio_offset_sec(meta, start_sec=config.start_sec)
+
+        final_audio_path = (prep_dir / audio_path.name) if audio_path is not None else None
+        payload = {
+            "source_video": str(canonical_source),
+            "source_sha256": source_sha256,
+            "prep_generation": prep_gen,
+            "frames_digest": frames_digest,
+            "roi_frames_digest": roi_frames_digest,
+            "audio_sha256": audio_sha256,
+            "audio_filename": audio_path.name if audio_path is not None else None,
+            "audio_offset_sec": audio_offset if audio_path is not None else 0.0,
+            "start_sec": config.start_sec,
+            "requested_duration_sec": config.duration_sec,
+            "requested_fps": config.fps,
+            "requested_crop_size": config.crop_size,
+            "requested_roi_box": list(config.roi_box) if config.roi_box is not None else None,
+            "requested_detector": config.detector,
+            "duration_sec": round(n_frames / float(fps), 4),
+            "fps": fps,
+            "num_frames": n_frames,
+            "full_width": W,
+            "full_height": H,
+            "crop_size": crop_size,
+            "roi_size": config.roi_size,
+            "audio_path": str(final_audio_path) if final_audio_path is not None else None,
+            "detector": init_geom.source,
+            "init_frame_idx": init_idx,
+            "init_eye_geometry_full": init_geom.to_dict(),
+            "init_eye_geometry_roi": eye_geom_roi_seed,
+            "video_metadata": meta.to_dict(),
+            "redetected_count": int(redetected.sum()),
+            "frames": frame_records,
+        }
+        atomic_write_text(stage_prep / "roi_boxes.json", json.dumps(payload, indent=2))
+
+        if config.write_qa_grid:
+            build_roi_track_qa_grid(
+                roi_dir,
+                frame_records,
+                fps=fps,
+                out_path=stage_prep / "roi_track_qa_grid.jpg",
+                n_samples=config.qa_grid_samples,
+            )
+
+        atomic_swap_directory(stage_prep, prep_dir)
+    except BaseException:
+        if stage_prep.exists():
+            shutil.rmtree(stage_prep, ignore_errors=True)
         raise
-
-    # Project detected eye geometry directly into init_idx's ROI coordinates (not a potentially blank frame 0)
-    seed_rec = frame_records[init_idx]
-    box_seed = (seed_rec["x1"], seed_rec["y1"], seed_rec["x2"], seed_rec["y2"])
-    eye_geom_roi_seed = init_geom.project_to_roi(box_seed, config.roi_size, shift=(0.0, 0.0))
-
-    frames_dir = prep_dir / "frames"
-    frames_digest = hash_files_manifest(frames_dir, filenames)
-    roi_frames_digest = hash_files_manifest(roi_dir, filenames)
-    audio_sha256 = hash_file_sha256(audio_path) if audio_path is not None else None
-
-    payload = {
-        "source_video": str(source_path),
-        "source_sha256": source_sha256,
-        "prep_generation": prep_gen,
-        "frames_digest": frames_digest,
-        "roi_frames_digest": roi_frames_digest,
-        "audio_sha256": audio_sha256,
-        "audio_filename": audio_path.name if audio_path is not None else None,
-        "start_sec": config.start_sec,
-        "requested_duration_sec": config.duration_sec,
-        "requested_fps": config.fps,
-        "requested_crop_size": config.crop_size,
-        "requested_roi_box": list(config.roi_box) if config.roi_box is not None else None,
-        "requested_detector": config.detector,
-        "duration_sec": round(n_frames / float(fps), 4),
-        "fps": fps,
-        "num_frames": n_frames,
-        "full_width": W,
-        "full_height": H,
-        "crop_size": crop_size,
-        "roi_size": config.roi_size,
-        "audio_path": str(audio_path) if audio_path is not None else None,
-        "detector": init_geom.source,
-        "init_frame_idx": init_idx,
-        "init_eye_geometry_full": init_geom.to_dict(),
-        "init_eye_geometry_roi": eye_geom_roi_seed,
-        "video_metadata": meta.to_dict(),
-        "redetected_count": int(redetected.sum()),
-        "frames": frame_records,
-    }
-    atomic_write_text(prep_dir / "roi_boxes.json", json.dumps(payload, indent=2))
-
-    if config.write_qa_grid:
-        build_roi_track_qa_grid(
-            roi_dir,
-            frame_records,
-            fps=fps,
-            out_path=prep_dir / "roi_track_qa_grid.jpg",
-            n_samples=config.qa_grid_samples,
-        )
 
     return payload

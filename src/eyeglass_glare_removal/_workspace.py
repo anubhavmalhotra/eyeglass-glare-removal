@@ -43,46 +43,68 @@ def reject_symlink_path(path: Path, label: str = "path") -> None:
         raise ValueError(f"Symlinked {label} is not allowed inside workspace: {path}")
 
 
+def reject_symlink_components_under(anchor_root: Path, target: Path) -> None:
+    """
+    Walk every lexical path component from `anchor_root` down to `target` BEFORE resolving,
+    rejecting any parent traversal or intermediate/leaf symlink.
+    """
+    reject_symlink_path(anchor_root, "workspace root")
+    if ".." in target.parts:
+        raise ValueError(f"Parent traversal '..' forbidden in workspace path: {target}")
+    # Compute lexical relative path without resolving symlinks first
+    try:
+        rel = target.relative_to(anchor_root)
+    except ValueError:
+        # Compare absolute non-symlink-resolved forms (handles relative vs absolute anchor)
+        abs_root = Path(os.path.abspath(str(anchor_root)))
+        abs_target = Path(os.path.abspath(str(target)))
+        try:
+            rel = abs_target.relative_to(abs_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Path {target} is not lexically confined within workspace root {anchor_root}"
+            ) from exc
+        anchor_root = abs_root
+
+    cur = anchor_root
+    for part in rel.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError(f"Parent traversal '..' forbidden in workspace path: {target}")
+        cur = cur / part
+        reject_symlink_path(cur, "workspace component")
+
+
 def ensure_confined_dir(root: Path, sub_path: Path, *, create: bool = True) -> Path:
     """
-    Ensure `sub_path` is strictly confined within `root` without traversing any symlinks.
+    Ensure `sub_path` is strictly confined within `root` without traversing ANY symlinked
+    ancestor or leaf component.
     """
-    reject_symlink_path(root, "workspace root")
+    reject_symlink_components_under(root, sub_path)
     if create:
         root.mkdir(parents=True, exist_ok=True)
-    root_resolved = root.resolve()
-
-    # Walk relative parts if sub_path is lexically under root, rejecting any symlink component
-    try:
-        rel = sub_path.relative_to(root)
-    except ValueError as exc:
-        # Compare resolved only after ensuring neither root nor sub_path is a symlink
-        reject_symlink_path(sub_path, "workspace subdirectory")
-        sub_res = sub_path.resolve()
-        if not sub_res.is_relative_to(root_resolved):
-            raise ValueError(
-                f"Directory {sub_path} escapes confined workspace root {root}"
-            ) from exc
-        rel = sub_res.relative_to(root_resolved)
-
-    cur = root
-    for part in rel.parts:
-        cur = cur / part
-        reject_symlink_path(cur, "workspace directory")
-
-    if create:
-        cur.mkdir(parents=True, exist_ok=True)
-    if not cur.resolve().is_relative_to(root_resolved):
+        sub_path.mkdir(parents=True, exist_ok=True)
+    root_res = root.resolve()
+    sub_res = sub_path.resolve(strict=False)
+    if not sub_res.is_relative_to(root_res):
         raise ValueError(f"Directory {sub_path} escapes confined workspace root {root}")
-    return cur
+    return sub_path
 
 
 def ensure_safe_child_file(
-    parent_dir: Path, filename: str, *, allow_missing: bool = False
+    parent_dir: Path,
+    filename: str,
+    *,
+    allow_missing: bool = False,
+    workspace_root: Path | None = None,
 ) -> Path:
-    """Validate basename, ensure parent_dir & child are not symlinks, and verify confinement."""
+    """Validate basename, ensure parent_dir (and ancestors under workspace_root) & child are not symlinks."""
     safe_name = validate_safe_basename(filename)
-    reject_symlink_path(parent_dir, "workspace directory")
+    if workspace_root is not None:
+        reject_symlink_components_under(workspace_root, parent_dir)
+    else:
+        reject_symlink_path(parent_dir, "workspace directory")
     target = parent_dir / safe_name
     reject_symlink_path(target, "workspace file")
     if target.parent.resolve() != parent_dir.resolve():
@@ -93,19 +115,15 @@ def ensure_safe_child_file(
 
 
 def ensure_confined_existing_file(root: Path, candidate: Path) -> Path:
-    """Verify an existing file path referenced in workspace metadata stays confined inside root."""
-    reject_symlink_path(root, "workspace root")
-    reject_symlink_path(candidate, "workspace file")
+    """
+    Verify an existing file path referenced in workspace metadata stays lexically AND canonically
+    confined inside `root` with ZERO symlinked ancestor or leaf components.
+    """
+    reject_symlink_components_under(root, candidate)
     root_res = root.resolve()
-    cand_res = candidate.resolve()
+    cand_res = candidate.resolve(strict=False)
     if not cand_res.is_relative_to(root_res):
         raise ValueError(f"Referenced file {candidate} escapes workspace {root}")
-    # Also ensure no intermediate directory component under root is a symlink
-    rel = cand_res.relative_to(root_res)
-    cur = root
-    for part in rel.parts:
-        cur = cur / part
-        reject_symlink_path(cur, "workspace component")
     return candidate
 
 
@@ -138,12 +156,53 @@ def paths_alias(a: Path, b: Path) -> bool:
     return False
 
 
+def assert_source_outside_managed_dir(source_path: Path, managed_dir: Path) -> None:
+    """
+    Reject any source file that aliases or resides inside a managed workspace directory
+    (including hardlinks/symlinks to reserved files such as audio.m4a or frames/).
+    """
+    src_res = source_path.resolve(strict=False)
+    dir_res = managed_dir.resolve(strict=False)
+    src_lex = Path(os.path.abspath(str(source_path)))
+    dir_lex = Path(os.path.abspath(str(managed_dir)))
+
+    if paths_alias(source_path, managed_dir):
+        raise ValueError(
+            f"Input source ({source_path}) aliases managed directory ({managed_dir})."
+        )
+    if src_res.is_relative_to(dir_res) or src_lex.is_relative_to(dir_lex):
+        raise ValueError(
+            f"Input source ({source_path}) resides inside managed workspace directory "
+            f"({managed_dir}); refusing to proceed to prevent accidental deletion."
+        )
+
+    # Check hardlink/symlink aliases against existing files in managed_dir (e.g. audio.m4a or frames)
+    if source_path.exists() and managed_dir.exists() and managed_dir.is_dir():
+        for reserved in (
+            managed_dir / "audio.m4a",
+            managed_dir / "prep" / "audio.m4a",
+        ):
+            if reserved.exists() and paths_alias(source_path, reserved):
+                raise ValueError(
+                    f"Input source ({source_path}) aliases managed workspace file ({reserved}); "
+                    "refusing to proceed to prevent overwriting source media."
+                )
+        # Also walk managed frames/roi trees to detect hardlinked source files before swap/delete
+        for root_str, _dirs, files in os.walk(managed_dir, followlinks=False):
+            root_p = Path(root_str)
+            for fn in files:
+                fp = root_p / fn
+                if paths_alias(source_path, fp):
+                    raise ValueError(
+                        f"Input source ({source_path}) aliases existing workspace file ({fp}); "
+                        "refusing to proceed to prevent source deletion."
+                    )
+
+
 def assert_distinct_output_paths(
     source_path: Path | None, outputs: list[tuple[str, Path | None]]
 ) -> None:
-    """
-    Verify no output destination aliases `source_path` or another output destination.
-    """
+    """Verify no output destination aliases `source_path` or another output destination."""
     active: list[tuple[str, Path]] = [(lbl, p) for lbl, p in outputs if p is not None]
     if source_path is not None:
         for lbl, out_p in active:
@@ -175,12 +234,20 @@ def hash_file_sha256(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def hash_files_manifest(parent_dir: Path, filenames: list[str]) -> str:
+def hash_files_manifest(
+    parent_dir: Path, filenames: list[str], *, workspace_root: Path | None = None
+) -> str:
     """Compute an order-sensitive SHA-256 digest over validated files inside parent_dir."""
+    if workspace_root is not None:
+        reject_symlink_components_under(workspace_root, parent_dir)
+    else:
+        reject_symlink_path(parent_dir, "workspace directory")
     h = hashlib.sha256()
     h.update(f"count={len(filenames)}\n".encode())
     for fn in filenames:
-        fp = ensure_safe_child_file(parent_dir, fn, allow_missing=False)
+        fp = ensure_safe_child_file(
+            parent_dir, fn, allow_missing=False, workspace_root=workspace_root
+        )
         h.update(fn.encode("utf-8"))
         h.update(b":")
         h.update(hash_file_sha256(fp).encode("ascii"))
@@ -227,7 +294,7 @@ def atomic_write_text(path: Path, content: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
-    except Exception:
+    except BaseException:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         raise
@@ -241,7 +308,7 @@ def make_unique_temp_dir(parent: Path, prefix: str = ".stage_") -> Path:
 
 
 def make_unique_temp_sibling(dest: Path) -> Path:
-    """Reserve a unique temporary sibling file path for atomic output encoding (e.g. ffmpeg)."""
+    """Reserve a unique temporary sibling file path for atomic output encoding."""
     reject_symlink_path(dest.parent, "output directory")
     reject_symlink_path(dest, "output file")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -257,13 +324,16 @@ def atomic_swap_directory(staging_dir: Path, target_dir: Path) -> None:
     """
     Atomically publish a fully populated `staging_dir` into `target_dir` without in-place mutation.
 
-    Uses a unique backup sibling name if `target_dir` already exists, then cleans up backup.
+    - Handles `BaseException` (including KeyboardInterrupt) for rollback.
+    - Preserves `backup_dir` on disk if rollback itself fails so previous artifacts are never lost.
     """
     reject_symlink_path(target_dir.parent, "parent directory")
     reject_symlink_path(target_dir, "target directory")
     reject_symlink_path(staging_dir, "staging directory")
 
     backup_dir: Path | None = None
+    committed = False
+    rollback_succeeded = False
     try:
         if target_dir.exists():
             backup_dir = Path(
@@ -272,25 +342,93 @@ def atomic_swap_directory(staging_dir: Path, target_dir: Path) -> None:
             backup_dir.rmdir()
             os.replace(target_dir, backup_dir)
         os.replace(staging_dir, target_dir)
-    except Exception:
-        # Roll back previous target_dir if swap failed midway
+        committed = True
+    except BaseException:
         if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
             try:
                 os.replace(backup_dir, target_dir)
-            except OSError:
-                pass
+                rollback_succeeded = True
+            except OSError as rb_exc:
+                logger.error(
+                    "Rollback failed restoring %s from %s (%s); preserving backup copy at %s.",
+                    target_dir,
+                    backup_dir,
+                    rb_exc,
+                    backup_dir,
+                )
         raise
     finally:
-        if backup_dir is not None and backup_dir.exists():
+        # Delete backup ONLY when commit succeeded or rollback cleanly restored target_dir
+        if backup_dir is not None and backup_dir.exists() and (committed or rollback_succeeded):
             shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def atomic_commit_paths(staged_to_dest: list[tuple[Path, Path]]) -> None:
+    """
+    Commit multiple staged files and/or directories into their final destinations as one
+    rollback-safe transaction.
+
+    - Handles `BaseException` (including KeyboardInterrupt) for rollback.
+    - Rolls back directories cleanly by moving the newly swapped destination back to its
+      staging path before restoring its backup (avoiding POSIX ENOTEMPTY).
+    - Preserves backup copies on disk if rollback itself fails.
+    """
+    if not staged_to_dest:
+        return
+
+    for staged, dest in staged_to_dest:
+        reject_symlink_path(dest.parent, "destination parent directory")
+        reject_symlink_path(dest, "destination path")
+        reject_symlink_path(staged, "staged path")
+
+    # Each entry: (staged, dest, backup_path_or_None, dest_was_swapped_in)
+    applied: list[tuple[Path, Path, Path | None, bool]] = []
+    committed = False
+    rollback_ok = True
+    try:
+        for staged, dest in staged_to_dest:
+            backup: Path | None = None
+            if dest.exists():
+                backup = Path(
+                    tempfile.mkdtemp(dir=str(dest.parent), prefix=f".bak_{dest.name}_")
+                )
+                backup.rmdir()
+                os.replace(dest, backup)
+            # Record backup before swapping staged -> dest so even if the second replace fails,
+            # backup is restored cleanly.
+            applied.append((staged, dest, backup, False))
+            os.replace(staged, dest)
+            applied[-1] = (staged, dest, backup, True)
+        committed = True
+    except BaseException:
+        for staged, dest, backup, swapped in reversed(applied):
+            try:
+                if swapped and dest.exists():
+                    os.replace(dest, staged)
+                if backup is not None and backup.exists() and not dest.exists():
+                    os.replace(backup, dest)
+            except OSError as rb_exc:
+                rollback_ok = False
+                logger.error(
+                    "Rollback failed restoring %s from backup %s (%s); preserving backup.",
+                    dest,
+                    backup,
+                    rb_exc,
+                )
+        raise
+    finally:
+        if committed or rollback_ok:
+            for _, _, backup, _ in applied:
+                if backup is not None and backup.exists():
+                    if backup.is_dir() and not backup.is_symlink():
+                        shutil.rmtree(backup, ignore_errors=True)
+                    else:
+                        backup.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
 def workdir_lock(work_dir: Path) -> Iterator[None]:
-    """
-    Acquire an exclusive cross-process lock for the entire workdir lifecycle so two
-    concurrent runs cannot interleave stage outputs or temp files.
-    """
+    """Acquire an exclusive cross-process lock for the entire workdir lifecycle."""
     reject_symlink_path(work_dir, "work_dir")
     work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = work_dir / ".workdir.lock"

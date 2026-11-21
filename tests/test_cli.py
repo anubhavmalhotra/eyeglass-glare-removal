@@ -230,6 +230,7 @@ def test_content_bound_resume_invalidates_on_replaced_video_or_corrupt_artifacts
     layout.mask_stats_json.write_text(
         json.dumps(
             {
+                "prep_generation": roi_meta["prep_generation"],
                 "sam2_generation": sam2_g,
                 "segment_generation": seg_g,
                 "roi_frames_digest": roi_d,
@@ -244,3 +245,231 @@ def test_content_bound_resume_invalidates_on_replaced_video_or_corrupt_artifacts
     # Corrupting a mask PNG with garbage invalidates Stage 2 resume!
     (layout.roi_glare_hotspot_dir / "000000.png").write_bytes(b"corrupt")
     assert _segment_is_complete(layout, roi_meta, cfg_preview) is None
+
+
+def test_round3_p0_p1_cli_generation_chain_symlink_ancestors_schema_and_atomic_rollback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regressions P0-1, P0-3, P0-4, P1-11, P1-12."""
+    import os
+
+    from eyeglass_glare_removal import _workspace
+    from eyeglass_glare_removal.pipeline import verify_prep_artifacts
+
+    # --- P0-1: CLI `prep` refuses input inside work_dir or aliased to audio.m4a ---
+    w_p01 = tmp_path / "w_p01"
+    (w_p01 / "prep").mkdir(parents=True)
+    inside_vid = w_p01 / "prep" / "clip.mp4"
+    inside_vid.write_bytes(b"PRECIOUS_VIDEO")
+    rc = cli.main(["prep", str(inside_vid), "--work-dir", str(w_p01)])
+    assert rc == 1
+    assert inside_vid.read_bytes() == b"PRECIOUS_VIDEO"
+    capsys.readouterr()
+
+    # --- P0-4: symlinked `prep` or `masks` ANCESTOR rejected even when leaf manifests are ordinary ---
+    w_sym = tmp_path / "w_sym"
+    w_sym.mkdir()
+    outside_prep = tmp_path / "outside_prep"
+    (outside_prep / "frames").mkdir(parents=True)
+    (outside_prep / "roi_frames").mkdir(parents=True)
+    Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(outside_prep / "frames" / "000000.png")
+    Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(
+        outside_prep / "roi_frames" / "000000.png"
+    )
+    (outside_prep / "roi_boxes.json").write_text("{}", encoding="utf-8")
+    (w_sym / "prep").symlink_to(outside_prep)
+
+    sym_layout = WorkDirLayout(w_sym)
+    dummy_in = tmp_path / "dummy.mp4"
+    dummy_in.write_bytes(b"x")
+    dummy_cfg = PipelineConfig(input_path=dummy_in, output_path=tmp_path / "o.mp4", work_dir=w_sym)
+    with pytest.raises(ValueError, match="Symlinked"):
+        _prep_matches_config(sym_layout, dummy_cfg)
+    with pytest.raises(ValueError, match="Symlinked"):
+        verify_prep_artifacts(sym_layout)
+
+    # --- P1-12: valid JSON with invalid schema (null, [], bad types) returns None on resume ---
+    w_schema = tmp_path / "w_schema"
+    sl = WorkDirLayout(w_schema)
+    sl.prep_dir.mkdir(parents=True)
+    sl.masks_dir.mkdir(parents=True)
+    scfg = PipelineConfig(input_path=dummy_in, output_path=tmp_path / "os.mp4", work_dir=w_schema)
+    for bad in ("null", "[]", '"hello"', '{"num_frames": "bad"}', '{"num_frames": true}'):
+        sl.roi_boxes_json.write_text(bad, encoding="utf-8")
+        assert _prep_matches_config(sl, scfg) is None
+        sl.mask_stats_json.write_text(bad, encoding="utf-8")
+        assert _segment_is_complete(sl, {"num_frames": 1, "frames": [{"filename": "000000.png"}]}, scfg) is None
+
+    # --- P0-3: Clip A artifacts in workspace MUST be rejected after prep runs for Clip B! ---
+    w_mix = tmp_path / "w_mix"
+    ml = WorkDirLayout(w_mix)
+    for d in (
+        ml.frames_dir,
+        ml.roi_frames_dir,
+        ml.roi_lens_interior_dir,
+        ml.roi_lens_exact_dir,
+        ml.roi_glare_hotspot_dir,
+        ml.reference_dir,
+        ml.roi_cleaned_dir,
+    ):
+        d.mkdir(parents=True)
+
+    fn = "000000.png"
+    # Populate Clip A across all 4 stages
+    Image.fromarray(np.full((64, 64, 3), 10, dtype=np.uint8)).save(ml.frames_dir / fn)
+    Image.fromarray(np.full((64, 64, 3), 20, dtype=np.uint8)).save(ml.roi_frames_dir / fn)
+    for md in (ml.roi_lens_interior_dir, ml.roi_lens_exact_dir, ml.roi_glare_hotspot_dir):
+        Image.fromarray(np.zeros((64, 64), dtype=np.uint8)).save(md / fn)
+    Image.fromarray(np.full((64, 64, 3), 30, dtype=np.uint8)).save(ml.clean_eye_ref_png)
+    Image.fromarray(np.full((64, 64, 3), 40, dtype=np.uint8)).save(ml.roi_cleaned_dir / fn)
+
+    roi_a_digest = hash_files_manifest(ml.roi_frames_dir, [fn])
+    d_l = hash_files_manifest(ml.roi_lens_interior_dir, [fn])
+    d_e = hash_files_manifest(ml.roi_lens_exact_dir, [fn])
+    d_g = hash_files_manifest(ml.roi_glare_hotspot_dir, [fn])
+    masks_a_digest = hashlib.sha256(f"{d_l}:{d_e}:{d_g}".encode()).hexdigest()
+    cleaned_a_digest = hash_files_manifest(ml.roi_cleaned_dir, [fn])
+
+    ml.mask_stats_json.write_text(
+        json.dumps(
+            {
+                "prep_generation": "prep_CLIP_A",
+                "segment_generation": "seg_CLIP_A",
+                "roi_frames_digest": roi_a_digest,
+                "masks_digest": masks_a_digest,
+                "num_frames": 1,
+                "frames": [
+                    {
+                        "frame_idx": 0,
+                        "left_lens_roi_px": 100,
+                        "right_lens_roi_px": 100,
+                        "glare_left_pct": 0.0,
+                        "glare_right_pct": 0.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ml.reference_meta_json.write_text(
+        json.dumps(
+            {
+                "mode": "auto",
+                "strategy": "single_clean_frame",
+                "prep_generation": "prep_CLIP_A",
+                "segment_generation": "seg_CLIP_A",
+                "ref_sha256": hash_file_sha256(ml.clean_eye_ref_png),
+            }
+        ),
+        encoding="utf-8",
+    )
+    ml.edit_support_json.write_text(
+        json.dumps(
+            {
+                "prep_generation": "prep_CLIP_A",
+                "segment_generation": "seg_CLIP_A",
+                "roi_frames_digest": roi_a_digest,
+                "masks_digest": masks_a_digest,
+                "cleaned_roi_digest": cleaned_a_digest,
+                "num_frames": 1,
+                "frame_has_edit": [True],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Now overwrite prep/ with Clip B while leaving Clip A's masks/reference/inpaint behind!
+    Image.fromarray(np.full((64, 64, 3), 210, dtype=np.uint8)).save(ml.frames_dir / fn)
+    Image.fromarray(np.full((64, 64, 3), 220, dtype=np.uint8)).save(ml.roi_frames_dir / fn)
+    frames_b_digest = hash_files_manifest(ml.frames_dir, [fn])
+    roi_b_digest = hash_files_manifest(ml.roi_frames_dir, [fn])
+    ml.roi_boxes_json.write_text(
+        json.dumps(
+            {
+                "source_video": str((tmp_path / "clip_b.mp4").resolve()),
+                "prep_generation": "prep_CLIP_B",
+                "frames_digest": frames_b_digest,
+                "roi_frames_digest": roi_b_digest,
+                "audio_sha256": None,
+                "audio_filename": None,
+                "fps": 30.0,
+                "full_width": 64,
+                "full_height": 64,
+                "roi_size": 64,
+                "num_frames": 1,
+                "frames": [{"frame_idx": 0, "filename": fn, "x1": 0, "y1": 0, "x2": 64, "y2": 64}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # ALL standalone downstream stages MUST fail cleanly with generation mismatch!
+    for argv in [
+        ["reference", "--work-dir", str(w_mix)],
+        ["inpaint", "--work-dir", str(w_mix)],
+        ["composite", "--work-dir", str(w_mix), "-o", str(tmp_path / "mix_out.mp4")],
+    ]:
+        assert cli.main(argv) == 1
+        err = capsys.readouterr().err.lower()
+        assert "generation mismatch" in err or "digest mismatch" in err
+
+    # Now update masks to Clip B, leaving Clip A's reference/ & inpaint/ behind -> BOTH fail!
+    ml.mask_stats_json.write_text(
+        json.dumps(
+            {
+                "prep_generation": "prep_CLIP_B",
+                "segment_generation": "seg_CLIP_B",
+                "roi_frames_digest": roi_b_digest,
+                "masks_digest": masks_a_digest,
+                "num_frames": 1,
+                "frames": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cli.main(["inpaint", "--work-dir", str(w_mix)]) == 1
+    assert "stale reference" in capsys.readouterr().err.lower()
+    assert cli.main(["composite", "--work-dir", str(w_mix), "-o", str(tmp_path / "mix_out.mp4")]) == 1
+    assert "generation mismatch" in capsys.readouterr().err.lower()
+
+    # --- P1-11: atomic_swap_directory handles KeyboardInterrupt AND preserves backup on rollback error ---
+    tgt = tmp_path / "tgt_dir"
+    tgt.mkdir()
+    (tgt / "data.txt").write_text("OLD_DATA", encoding="utf-8")
+    stg = tmp_path / "stg_dir"
+    stg.mkdir()
+    (stg / "data.txt").write_text("NEW_DATA", encoding="utf-8")
+
+    real_replace = os.replace
+    calls = 0
+
+    def interrupt_on_second_replace(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("user aborted mid-swap")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_workspace.os, "replace", interrupt_on_second_replace)
+    with pytest.raises(KeyboardInterrupt):
+        _workspace.atomic_swap_directory(stg, tgt)
+    monkeypatch.setattr(_workspace.os, "replace", real_replace)
+    assert (tgt / "data.txt").read_text(encoding="utf-8") == "OLD_DATA"
+
+    # Now fail BOTH the second replace AND the rollback replace -> backup MUST stay on disk!
+    calls = 0
+
+    def fail_commit_and_rollback(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise OSError("disk error during commit/rollback")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_workspace.os, "replace", fail_commit_and_rollback)
+    with pytest.raises(OSError):
+        _workspace.atomic_swap_directory(stg, tgt)
+    monkeypatch.setattr(_workspace.os, "replace", real_replace)
+    preserved_backups = list(tmp_path.glob(".old_tgt_dir_*"))
+    assert len(preserved_backups) == 1
+    assert (preserved_backups[0] / "data.txt").read_text(encoding="utf-8") == "OLD_DATA"

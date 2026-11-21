@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 
 from eyeglass_glare_removal._workspace import (
     assert_distinct_output_paths,
+    assert_source_outside_managed_dir,
     ensure_safe_child_file,
     make_unique_temp_sibling,
     reject_symlink_path,
@@ -137,15 +138,14 @@ def compute_rim_safe_alpha(
     Compute `(alpha_roi [0..1 float32], active_support_roi [uint8 0/255])`.
 
     Key guarantees:
-    1. When `glare_mask_roi` is provided and empty (zero glare), returns all-zero alpha and
-       all-zero support so clean frames & clean lenses are preserved bit-for-bit untouched.
-    2. When `glare_mask_roi` is provided, interior replacement is gated to the active glare
-       edit support (clean areas far from glare and clean opposite lenses stay untouched).
-    3. Morphological top-hat / black-hat + dark + chromatic rim protection applies on BOTH
-       sides of the lens boundary (outermost 2px inside `base_bin` AND `bevel_ring` outside),
-       protecting dark/black/bronze, bright neutral silver/gold metallic wires (even if clean
-       darkened them heavily), and tortoiseshell/colored frames while allowing broad bright
-       glare on a rimless bevel to be suppressed cleanly.
+    1. Per-lens isolation BEFORE dilation: inactive clean lenses (and their surrounding rims)
+       remain strictly at `alpha == 0.0` even when glare sits right near the nose bridge on the
+       opposite lens.
+    2. Multi-scale morphological top-hat/black-hat (9x9 + 17x17) + deep-core Voronoi contour-step
+       + dark + chromatic rim shields protect thin (2px) AND wide (6–8px) dark, metallic
+       silver/gold/chrome, and tortoiseshell rims straddling BOTH sides of the lens boundary.
+    3. Final rim exclusion is applied AFTER core-alpha restoration so rim-protected pixels can
+       never be forced to `1.0`.
     """
     H, W = lens_mask_roi.shape[:2]
     if glare_mask_roi is not None and int((glare_mask_roi > 0).sum()) == 0:
@@ -161,28 +161,50 @@ def compute_rim_safe_alpha(
         )
         base_bin = cv2.dilate(base_bin, ke, iterations=1)
 
-    # Gate base lens interior to active edit support when glare mask is provided
+    # Identify active vs inactive lenses INDIVIDUALLY BEFORE any glare dilation so edit support
+    # can NEVER bleed across a narrow nose bridge into a clean opposite lens!
+    inactive_lenses = np.zeros((H, W), dtype=bool)
+    active_lens_union = np.zeros((H, W), dtype=np.uint8)
+
     if glare_mask_roi is not None:
+        glare_pos = glare_mask_roi > 0
         edit_pad = max(8, int(round(feather_px * 3.0)) + 5)
         k_edit = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * edit_pad + 1, 2 * edit_pad + 1)
         )
-        glare_support = cv2.dilate((glare_mask_roi > 0).astype(np.uint8), k_edit, iterations=1)
-        active_base = ((base_bin > 0) & (glare_support > 0)).astype(np.uint8)
+        n_comp, comp_labels = cv2.connectedComponents(base_bin, connectivity=8)
+        active_base = np.zeros((H, W), dtype=np.uint8)
+
+        for lbl in range(1, n_comp):
+            comp = comp_labels == lbl
+            comp_glare = comp & glare_pos
+            if int(comp_glare.sum()) == 0:
+                inactive_lenses |= comp
+                continue
+            active_lens_union[comp] = 1
+            comp_support = cv2.dilate(comp_glare.astype(np.uint8), k_edit, iterations=1) > 0
+            active_base[comp & comp_support] = 1
+
         if int(active_base.sum()) == 0:
             return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=np.uint8)
         alpha_interior = inward_feather_alpha(active_base * 255, feather_px=max(feather_px, 2.0))
     else:
+        active_lens_union = base_bin.copy()
         active_base = base_bin
         alpha_interior = inward_feather_alpha(active_base * 255, feather_px=feather_px)
 
-    # Compute structural & photometric rim protection (used on BOTH sides of lens boundary!)
+    # Guard zone strictly protecting inactive clean lenses and their immediate 2px rim halo
+    if inactive_lenses.any():
+        k_inact = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        inactive_guard = cv2.dilate(inactive_lenses.astype(np.uint8), k_inact, iterations=1) > 0
+    else:
+        inactive_guard = np.zeros((H, W), dtype=bool)
+
     o = orig_roi_rgb.astype(np.float32)
     c = clean_roi_rgb.astype(np.float32)
     o_luma = 0.299 * o[:, :, 0] + 0.587 * o[:, :, 1] + 0.114 * o[:, :, 2]
     c_luma = 0.299 * c[:, :, 0] + 0.587 * c[:, :, 1] + 0.114 * c[:, :, 2]
 
-    # Estimate local face reference outside bevel band (color-agnostic)
     ref_in_r = max(3, bevel_band_px + 3)
     ref_out_r = max(14, bevel_band_px + 18)
     k_ref_in = cv2.getStructuringElement(
@@ -196,34 +218,39 @@ def compute_rim_safe_alpha(
         float(np.median(o_luma[face_ring])) if int(face_ring.sum()) >= 50 else float(np.median(o_luma))
     )
 
-    # Inner rim guard band: outermost 2px INSIDE base_bin also respects structural rim protection
-    k_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    strict_core_all = cv2.erode(base_bin, k_inner, iterations=1) > 0
-    strict_core = strict_core_all & (active_base > 0)
-    inner_rim_zone = (active_base > 0) & (~strict_core)
+    # Wider inner rim guard (6px inward) so chunky 6–8px straddling metallic/acetate rims are covered
+    k_inner_guard = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    deep_core_all = cv2.erode(base_bin, k_inner_guard, iterations=1) > 0
+    deep_core = deep_core_all & (active_base > 0)
+    inner_rim_zone = (active_base > 0) & (~deep_core)
 
-    # Cue 1: Color-agnostic dark rim shield (black, charcoal, brown, bronze, navy, dark tortoise)
+    # Cue 1: Color-agnostic dark rim shield
     dark_thresh = max(45.0, min(115.0, local_luma - 14.0))
     dark_rim_prob = smoothstep((dark_thresh - o_luma) / 16.0)
 
-    # Cue 2: Scale-selective morphological top-hat/black-hat thin-wire shield + Voronoi contour-step
-    # rim shield. Protects dark, bright neutral silver/gold/chrome, and straddling metallic rims
-    # (even when clean_roi drastically darkens them!) while staying 0 on continuous rimless bevel glare.
-    k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    tophat = o_luma - cv2.morphologyEx(o_luma, cv2.MORPH_OPEN, k_rim)
-    blackhat = cv2.morphologyEx(o_luma, cv2.MORPH_CLOSE, k_rim) - o_luma
+    # Cue 2: Multi-scale morphological top-hat & black-hat (9x9 thin wires + 17x17 wide rims)
+    k_rim_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k_rim_lg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    tophat = np.maximum(
+        o_luma - cv2.morphologyEx(o_luma, cv2.MORPH_OPEN, k_rim_sm),
+        o_luma - cv2.morphologyEx(o_luma, cv2.MORPH_OPEN, k_rim_lg),
+    )
+    blackhat = np.maximum(
+        cv2.morphologyEx(o_luma, cv2.MORPH_CLOSE, k_rim_sm) - o_luma,
+        cv2.morphologyEx(o_luma, cv2.MORPH_CLOSE, k_rim_lg) - o_luma,
+    )
     thin_wire_prob = np.maximum(
         smoothstep((tophat - 16.0) / 18.0),
         smoothstep((blackhat - 16.0) / 18.0),
     )
 
+    # Voronoi contour-step comparison against deep interior core + wide local edge (11x11)
     gx = cv2.Sobel(o_luma, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(o_luma, cv2.CV_32F, 0, 1, ksize=3)
     grad_o = cv2.magnitude(gx, gy) / 4.0
-    grad_local = cv2.dilate(grad_o, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    grad_local = cv2.dilate(grad_o, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
 
-    # Compare boundary pixels against their nearest interior pixel inside strict_core (or base_bin)
-    ref_core = strict_core_all if int(strict_core_all.sum()) > 0 else (base_bin > 0)
+    ref_core = deep_core_all if int(deep_core_all.sum()) > 0 else (base_bin > 0)
     ys_in, xs_in = np.where(ref_core)
     if ys_in.size > 0:
         _, nearest_lbl = cv2.distanceTransformWithLabels(
@@ -247,7 +274,7 @@ def compute_rim_safe_alpha(
 
     structural_rim_prob = np.maximum(thin_wire_prob, distinct_rim_prob)
 
-    # Cue 3: Chromatic/tortoiseshell acetate shield (high non-AR saturation relative to local face)
+    # Cue 3: Chromatic/tortoiseshell acetate shield
     o_purple = np.minimum(o[:, :, 0] - o[:, :, 1], o[:, :, 2] - o[:, :, 1])
     o_green = np.minimum(o[:, :, 1] - o[:, :, 0], o[:, :, 1] - o[:, :, 2])
     o_chroma = np.max(o, axis=2) - np.min(o, axis=2)
@@ -272,7 +299,8 @@ def compute_rim_safe_alpha(
     )
 
     if bevel_band_px <= 0:
-        alpha_guarded = np.where(inner_rim_zone, alpha_interior * w_rim_protect, alpha_interior)
+        alpha_guarded = np.where(inner_rim_zone, np.minimum(alpha_interior, w_rim_protect), alpha_interior)
+        alpha_guarded = np.where(inactive_guard, 0.0, alpha_guarded)
         support = ((active_base > 0) & (alpha_guarded > 0.01)).astype(np.uint8)
         return np.where(support > 0, alpha_guarded, 0.0).astype(np.float32), (support * 255).astype(
             np.uint8
@@ -282,7 +310,7 @@ def compute_rim_safe_alpha(
         cv2.MORPH_ELLIPSE, (2 * bevel_band_px + 1, 2 * bevel_band_px + 1)
     )
     outer_bin = cv2.dilate(active_base, kb, iterations=1)
-    bevel_ring = (outer_bin > 0) & (base_bin == 0)
+    bevel_ring = (outer_bin > 0) & (base_bin == 0) & (~inactive_guard)
 
     dist_out = cv2.distanceTransform(1 - active_base, cv2.DIST_L2, 5)
     w_dist = 1.0 - smoothstep((dist_out - bevel_band_px * 0.55) / max(1.0, bevel_band_px * 0.55))
@@ -291,7 +319,8 @@ def compute_rim_safe_alpha(
     if glare_mask_roi is not None:
         gate_r = max(12, bevel_band_px + 10)
         kg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gate_r + 1, 2 * gate_r + 1))
-        glare_near = cv2.dilate((glare_mask_roi > 64).astype(np.uint8), kg, iterations=1)
+        active_glare = ((glare_mask_roi > 64) & (active_lens_union > 0)).astype(np.uint8)
+        glare_near = cv2.dilate(active_glare, kg, iterations=1)
         w_gate = cv2.GaussianBlur(glare_near.astype(np.float32), (9, 9), 2.5)
     else:
         w_gate = np.ones_like(alpha_interior)
@@ -312,24 +341,26 @@ def compute_rim_safe_alpha(
         np.float32
     )
 
-    # Apply rim protection on BOTH sides of the lens boundary (inner_rim_zone AND bevel_ring)
+    boundary_band = inner_rim_zone | bevel_ring
     alpha_guarded_interior = np.where(inner_rim_zone, alpha_interior * w_rim_protect, alpha_interior)
     alpha_combined = np.maximum(np.maximum(alpha_guarded_interior, inner_glare_boost), bevel_alpha)
+    alpha_combined = np.where(boundary_band, np.minimum(alpha_combined, w_rim_protect), alpha_combined)
+    alpha_combined = np.where(inactive_guard, 0.0, alpha_combined)
 
-    boundary_band = inner_rim_zone | bevel_ring
-    alpha_combined = np.where(boundary_band, alpha_combined * w_rim_protect, alpha_combined)
-
-    active_support = (((active_base > 0) & (alpha_combined > 0.01)) | (bevel_alpha > 0.02)).astype(
-        np.uint8
-    )
+    active_support = (
+        (((active_base > 0) & (alpha_combined > 0.01)) | (bevel_alpha > 0.02)) & (~inactive_guard)
+    ).astype(np.uint8)
     alpha_smooth = cv2.GaussianBlur(alpha_combined.astype(np.float32), (3, 3), 0.7)
-    alpha_smooth = np.where(boundary_band, alpha_smooth * w_rim_protect, alpha_smooth)
 
+    # Restore 1.0 strictly in deep core interior that is NOT rim-protected, THEN enforce final
+    # rim exclusion on the entire boundary band so wide metallic rims can NEVER be forced to 1.0!
     alpha_roi = np.where(active_support > 0, np.clip(alpha_smooth, 0.0, 1.0), 0.0)
-    # Restore 1.0 strictly in deep core interior (never overriding rim pixels in boundary_band)
-    alpha_roi = np.maximum(
-        alpha_roi, np.where(strict_core & (alpha_interior >= 0.99), 1.0, 0.0)
-    )
+    safe_core = deep_core & (rim_prob < 0.20) & (alpha_interior >= 0.99)
+    alpha_roi = np.maximum(alpha_roi, np.where(safe_core, 1.0, 0.0))
+    alpha_roi = np.where(boundary_band, np.minimum(alpha_roi, w_rim_protect), alpha_roi)
+    alpha_roi = np.where(inactive_guard, 0.0, alpha_roi)
+    active_support = ((active_support > 0) & (alpha_roi > 0.01)).astype(np.uint8)
+    alpha_roi = np.where(active_support > 0, alpha_roi, 0.0)
 
     return alpha_roi.astype(np.float32), (active_support * 255).astype(np.uint8)
 
@@ -348,12 +379,7 @@ def composite_single_frame(
     suppress_chroma: bool = True,
     rim_protect_strength: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Composite a single cleaned ROI frame back onto `orig_full_rgb`.
-
-    Guarantees pre-encode RGB bit-exactness (`max_outside_diff == 0`) everywhere outside
-    the active glare-gated lens/bevel support mask (and across the entire frame when glare is empty).
-    """
+    """Composite a single cleaned ROI frame back onto `orig_full_rgb`."""
     H, W = orig_full_rgb.shape[:2]
     if glare_mask_roi is not None and int((glare_mask_roi > 0).sum()) == 0:
         return orig_full_rgb.copy(), np.zeros((H, W), dtype=np.uint8)
@@ -461,10 +487,7 @@ def compute_effective_batch_size(
     requested_batch_size: int,
     max_batch_mem_mb: int = 256,
 ) -> int:
-    """
-    Bound per-batch pixel memory by `max_batch_mem_mb` so 4K/8K comparison renders never
-    exhaust host RAM while smaller resolutions keep high parallelism.
-    """
+    """Bound per-batch pixel memory by `max_batch_mem_mb` so 4K/8K renders stay bounded in RAM."""
     main_bytes = full_w * full_h * 3
     if compare:
         cmp_w, cmp_h, _ = compute_compare_dimensions(full_w, full_h)
@@ -565,9 +588,50 @@ def build_compare_qa_grid(
     try:
         sheet.save(tmp_out, format="PNG")
         os.replace(tmp_out, out_path)
-    except Exception:
+    except BaseException:
         tmp_out.unlink(missing_ok=True)
         raise
+
+
+def _publish_files_atomically(pairs: list[tuple[Path, Path]]) -> None:
+    """
+    Publish one or more `(tmp_src, final_dest)` files with rollback protection on failure
+    or `BaseException` (preserving backup copies if rollback itself fails).
+    """
+    backups: list[tuple[Path, Path | None]] = []
+    committed = False
+    rollback_ok = True
+    try:
+        for tmp_src, dest in pairs:
+            backup: Path | None = None
+            if dest.exists():
+                backup = make_unique_temp_sibling(dest)
+                backup.unlink(missing_ok=True)
+                os.replace(dest, backup)
+            backups.append((dest, backup))
+            os.replace(tmp_src, dest)
+        committed = True
+    except BaseException:
+        for dest, backup in reversed(backups):
+            try:
+                if backup is not None and backup.exists():
+                    os.replace(backup, dest)
+                elif dest.exists():
+                    dest.unlink(missing_ok=True)
+            except OSError as rb_exc:
+                rollback_ok = False
+                logger.error(
+                    "Failed to roll back %s from backup %s (%s); preserving backup.",
+                    dest,
+                    backup,
+                    rb_exc,
+                )
+        raise
+    finally:
+        if committed or rollback_ok:
+            for _, backup in backups:
+                if backup is not None and backup.exists():
+                    backup.unlink(missing_ok=True)
 
 
 def run_composite_stage(
@@ -585,15 +649,7 @@ def run_composite_stage(
     source_video_path: Path | None = None,
     frame_has_edit: list[bool] | None = None,
 ) -> dict[str, Any]:
-    """
-    Execute Stage 5 bounded-RAM streaming composite directly into ffmpeg stdin.
-
-    - Checks source/output/compare/qa path identity before opening any writers.
-    - Encodes into unique temporary sibling files and atomically publishes only on success.
-    - Preserves source SAR & color metadata and supports optional `--lossless` RGB encoding.
-    - Uses authoritative CFR video clock (never `-shortest`).
-    - Adapts micro-batch size by byte budget so 4K/8K compare renders stay bounded in RAM.
-    """
+    """Execute Stage 5 bounded-RAM streaming composite with atomic multi-file publish."""
     t0 = time.time()
     fps = float(roi_meta["fps"])
     full_w = int(roi_meta["full_width"])
@@ -646,10 +702,18 @@ def run_composite_stage(
             else output_mp4.with_name(f"{output_mp4.stem}_qa_grid.png")
         )
 
-    # Verify no destination aliases source media (incl. symlinks/hardlinks) or collides with another output
+    # Verify source identity safely (reject relative legacy source_video unless --source given!)
     src_check = source_video_path
     if src_check is None and roi_meta.get("source_video"):
-        src_check = Path(str(roi_meta["source_video"]))
+        raw_src = Path(str(roi_meta["source_video"]))
+        if not raw_src.is_absolute():
+            raise ValueError(
+                f"Manifest roi_boxes.json contains a relative source_video ({raw_src}) whose "
+                "identity cannot be verified from an arbitrary working directory; "
+                "pass --source <path> explicitly or rerun prep."
+            )
+        src_check = raw_src
+
     assert_distinct_output_paths(
         src_check,
         [
@@ -666,9 +730,15 @@ def run_composite_stage(
     save_dir = Path(config.save_frames_dir) if config.save_frames_dir is not None else None
     if save_dir is not None:
         reject_symlink_path(save_dir, "save_frames_dir")
+        if src_check is not None:
+            assert_source_outside_managed_dir(src_check, save_dir)
+        for in_dir in (orig_dir, clean_dir, masks_dir, glare_dir):
+            if in_dir is not None and save_dir.resolve(strict=False) == in_dir.resolve(strict=False):
+                raise ValueError(
+                    f"save_frames_dir ({save_dir}) must not collide with input stage directory ({in_dir})."
+                )
         save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Validate all manifest filenames up front before launching ffmpeg
     for rec in frame_records:
         validate_safe_basename(str(rec["filename"]))
 
@@ -683,9 +753,12 @@ def run_composite_stage(
     src_primaries = vmeta.get("color_primaries")
     src_trc = vmeta.get("color_trc")
     src_colorspace = vmeta.get("colorspace")
+    src_color_range = vmeta.get("color_range")
+    audio_offset_sec = float(roi_meta.get("audio_offset_sec", 0.0) or 0.0)
 
     tmp_main = make_unique_temp_sibling(output_mp4)
     tmp_cmp = make_unique_temp_sibling(resolved_compare) if resolved_compare is not None else None
+    tmp_qa: Path | None = None
 
     eff_bs = compute_effective_batch_size(
         full_w,
@@ -702,6 +775,7 @@ def run_composite_stage(
         fps,
         tmp_main,
         audio_path=resolved_audio,
+        audio_offset_sec=audio_offset_sec,
         crf=config.crf,
         preset=config.preset,
         lossless=config.lossless,
@@ -710,6 +784,7 @@ def run_composite_stage(
         color_primaries=src_primaries,
         color_trc=src_trc,
         colorspace=src_colorspace,
+        color_range=src_color_range,
     )
     proc_cmp = None
     if tmp_cmp is not None:
@@ -720,6 +795,7 @@ def run_composite_stage(
             fps,
             tmp_cmp,
             audio_path=resolved_audio,
+            audio_offset_sec=audio_offset_sec,
             crf=config.crf,
             preset=config.preset,
             lossless=False,
@@ -727,6 +803,7 @@ def run_composite_stage(
             color_primaries=src_primaries,
             color_trc=src_trc,
             colorspace=src_colorspace,
+            color_range=src_color_range,
         )
 
     orig_zooms: list[tuple[int, float, np.ndarray]] = []
@@ -743,7 +820,6 @@ def run_composite_stage(
             raise FileNotFoundError(f"Missing original frame: {orig_fp}")
         orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
 
-        # Fast-path bypass: if frame has zero edit support, skip ROI resampling completely
         skip_edit = frame_has_edit is not None and i < len(frame_has_edit) and not frame_has_edit[i]
         glare_mask = None
         if not skip_edit and glare_dir is not None:
@@ -780,7 +856,18 @@ def run_composite_stage(
             )
 
         if save_dir is not None:
-            cv2.imwrite(str(save_dir / fn), cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR))
+            dst_frame = ensure_safe_child_file(save_dir, fn, allow_missing=True)
+            if src_check is not None:
+                assert_distinct_output_paths(src_check, [("saved_frame", dst_frame)])
+            tmp_frame = make_unique_temp_sibling(dst_frame)
+            try:
+                ok_w = cv2.imwrite(str(tmp_frame), cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR))
+                if not ok_w:
+                    raise RuntimeError(f"Failed to write frame PNG: {dst_frame}")
+                os.replace(tmp_frame, dst_frame)
+            except BaseException:
+                tmp_frame.unlink(missing_ok=True)
+                raise
 
         cmp_rgb = (
             build_compare_frame(orig_rgb, comp_rgb, box, i, fps) if proc_cmp is not None else None
@@ -789,7 +876,6 @@ def run_composite_stage(
         zoom_pair = None
         if i in grid_indices:
             t_sec = i / float(fps)
-            # Downscale QA tiles immediately so full-resolution frame arrays are never pinned in RAM
             oz_tile = cv2.resize(
                 extract_glasses_zoom_crop(orig_rgb, box),
                 (_QA_TILE_W, _QA_TILE_H),
@@ -824,13 +910,14 @@ def run_composite_stage(
         if proc_cmp is not None:
             close_video_writer_pipe(proc_cmp, "compare")
 
-        # Publish completed outputs atomically only after ffmpeg succeeded cleanly
-        os.replace(tmp_main, output_mp4)
+        publish_pairs: list[tuple[Path, Path]] = [(tmp_main, output_mp4)]
         if tmp_cmp is not None and resolved_compare is not None:
-            os.replace(tmp_cmp, resolved_compare)
-
-        if resolved_qa_grid is not None:
-            build_compare_qa_grid(orig_zooms, comp_zooms, resolved_qa_grid)
+            publish_pairs.append((tmp_cmp, resolved_compare))
+        if resolved_qa_grid is not None and orig_zooms:
+            tmp_qa = make_unique_temp_sibling(resolved_qa_grid)
+            build_compare_qa_grid(orig_zooms, comp_zooms, tmp_qa)
+            publish_pairs.append((tmp_qa, resolved_qa_grid))
+        _publish_files_atomically(publish_pairs)
 
         return {
             "output_mp4": str(output_mp4),
@@ -842,7 +929,7 @@ def run_composite_stage(
             "num_frames": n_frames,
             "elapsed_sec": round(time.time() - t0, 2),
         }
-    except Exception:
+    except BaseException:
         for p in (proc_main, proc_cmp):
             if p is not None and p.poll() is None:
                 p.kill()
@@ -850,4 +937,6 @@ def run_composite_stage(
         tmp_main.unlink(missing_ok=True)
         if tmp_cmp is not None:
             tmp_cmp.unlink(missing_ok=True)
+        if tmp_qa is not None:
+            tmp_qa.unlink(missing_ok=True)
         raise

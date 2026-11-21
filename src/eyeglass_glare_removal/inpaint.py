@@ -25,11 +25,13 @@ from eyeglass_glare_removal._runtime import (
     resolve_torch_device,
 )
 from eyeglass_glare_removal._workspace import (
+    atomic_commit_paths,
     atomic_swap_directory,
     atomic_write_text,
     ensure_confined_dir,
     ensure_safe_child_file,
     hash_file_sha256,
+    hash_files_manifest,
     make_unique_temp_dir,
     make_unique_temp_sibling,
     reject_symlink_path,
@@ -39,6 +41,9 @@ from eyeglass_glare_removal._workspace import (
 from eyeglass_glare_removal.config import InpaintConfig
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_VACE_SEQ_LEN = 512
+_DEFAULT_VACE_HIDDEN_DIM = 4096
 
 
 def pad_frame_count_4k1(num_frames: int) -> int:
@@ -165,7 +170,7 @@ def compute_run_fingerprint(
     *,
     inputs_digest: str = "",
 ) -> str:
-    """Stable hash of upstream input bytes + reference image bytes + effective inpaint config."""
+    """Stable hash of upstream input bytes + reference image bytes + all effective inpaint configs."""
     ref_part = "no_ref"
     if ref_paths:
         h_ref = hashlib.sha256()
@@ -180,6 +185,7 @@ def compute_run_fingerprint(
             "model_id": config.model_id,
             "text_encoder_model_id": config.text_encoder_model_id,
             "quantize_4bit": config.quantize_4bit,
+            "device": config.device,
             "size": config.size,
             "chunk_len": config.chunk_len,
             "min_overlap": config.min_overlap,
@@ -208,12 +214,7 @@ def is_chunk_complete(
     expected_fingerprint: str | None = None,
     expected_size: tuple[int, int] | None = None,
 ) -> bool:
-    """
-    Strictly validate an atomic chunk checkpoint:
-    - `done.json` schema, range, length, and config_fingerprint match.
-    - Every chunk PNG exists, is not a symlink, decodes cleanly as a valid image of expected
-      dimensions, and matches its recorded SHA-256 hash in `done.json`.
-    """
+    """Strictly validate chunk checkpoint JSON schema, types, PNG readability, dims, and SHA-256."""
     if chunk_dir.is_symlink() or not chunk_dir.is_dir():
         return False
     done_file = chunk_dir / "done.json"
@@ -221,23 +222,28 @@ def is_chunk_complete(
         return False
     try:
         meta = json.loads(done_file.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return False
+        if meta.get("num_frames") != expected_len:
+            return False
+        if expected_start is not None and meta.get("start") != expected_start:
+            return False
+        if expected_end is not None and meta.get("end") != expected_end:
+            return False
+        if expected_fingerprint is not None and meta.get("config_fingerprint") != expected_fingerprint:
+            return False
+
+        frame_hashes = meta.get("frame_hashes")
+        if not isinstance(frame_hashes, list) or len(frame_hashes) != expected_len:
+            return False
+        if not all(isinstance(h, str) and len(h) == 64 for h in frame_hashes):
+            return False
+        frame_has_edit = meta.get("frame_has_edit")
+        if not isinstance(frame_has_edit, list) or len(frame_has_edit) != expected_len:
+            return False
+        if not all(isinstance(v, bool) for v in frame_has_edit):
+            return False
     except Exception:
-        return False
-
-    if meta.get("num_frames") != expected_len:
-        return False
-    if expected_start is not None and meta.get("start") != expected_start:
-        return False
-    if expected_end is not None and meta.get("end") != expected_end:
-        return False
-    if expected_fingerprint is not None and meta.get("config_fingerprint") != expected_fingerprint:
-        return False
-
-    frame_hashes = meta.get("frame_hashes")
-    if not isinstance(frame_hashes, list) or len(frame_hashes) != expected_len:
-        return False
-    frame_has_edit = meta.get("frame_has_edit")
-    if not isinstance(frame_has_edit, list) or len(frame_has_edit) != expected_len:
         return False
 
     for li in range(expected_len):
@@ -245,7 +251,7 @@ def is_chunk_complete(
         if not verify_image_file(
             fp,
             expected_size=expected_size,
-            expected_sha256=str(frame_hashes[li]),
+            expected_sha256=frame_hashes[li],
         ):
             return False
     return True
@@ -293,29 +299,22 @@ def prep_frame_and_mask(
     return Image.fromarray(rgb), Image.fromarray(m_arr, mode="L"), glare_px
 
 
-def stream_blend_chunks(
+def _stage_blend_chunks(
     frame_filenames: list[str],
     chunks: list[tuple[int, int]],
     chunks_root: Path,
-    out_dir: Path,
+    parent_dir: Path,
     *,
     orig_frame_paths: list[Path] | None = None,
     frame_has_edit: list[bool] | None = None,
-) -> None:
-    """
-    Stream raised-cosine overlap blending frame-by-frame into a unique staging directory
-    and swap atomically into `out_dir`.
-
-    When `frame_has_edit[fi]` is False (zero effective glare mask on that frame), copies
-    the original ROI frame directly so mixed-chunk overlap weights never bleed VACE output
-    onto clean frames.
-    """
+) -> tuple[Path, str]:
+    """Stream raised-cosine overlap blending into a unique staging dir and return `(stage_dir, digest)`."""
     n = len(frame_filenames)
     safe_names = [validate_safe_basename(fn) for fn in frame_filenames]
     contribs = compute_overlap_weights(n, chunks)
 
-    reject_symlink_path(out_dir.parent, "inpaint directory")
-    stage_dir = make_unique_temp_dir(out_dir.parent, prefix=".stage_roi_cleaned_")
+    reject_symlink_path(parent_dir, "inpaint directory")
+    stage_dir = make_unique_temp_dir(parent_dir, prefix=".stage_roi_cleaned_")
 
     try:
         for fi in range(n):
@@ -345,11 +344,103 @@ def stream_blend_chunks(
                 blended = np.clip(acc / max(wsum, 1e-6), 0.0, 255.0).round().astype(np.uint8)
                 Image.fromarray(blended).save(dst)
 
-        atomic_swap_directory(stage_dir, out_dir)
-    except Exception:
+        cleaned_digest = hash_files_manifest(stage_dir, safe_names)
+        return stage_dir, cleaned_digest
+    except BaseException:
         if stage_dir.exists():
             shutil.rmtree(stage_dir, ignore_errors=True)
         raise
+
+
+def stream_blend_chunks(
+    frame_filenames: list[str],
+    chunks: list[tuple[int, int]],
+    chunks_root: Path,
+    out_dir: Path,
+    *,
+    orig_frame_paths: list[Path] | None = None,
+    frame_has_edit: list[bool] | None = None,
+) -> str:
+    """
+    Stream raised-cosine overlap blending into a unique staging dir, atomically swap into
+    `out_dir`, and return the manifest SHA-256 digest of the published cleaned ROIs.
+    """
+    stage_dir, cleaned_digest = _stage_blend_chunks(
+        frame_filenames,
+        chunks,
+        chunks_root,
+        out_dir.parent,
+        orig_frame_paths=orig_frame_paths,
+        frame_has_edit=frame_has_edit,
+    )
+    try:
+        atomic_swap_directory(stage_dir, out_dir)
+        return cleaned_digest
+    except BaseException:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+
+
+def _resolve_text_encoder_revision(text_model_id: str) -> str:
+    """Resolve an offline-safe encoder revision/config digest for prompt-embedding cache keying."""
+    p = Path(text_model_id)
+    if p.exists() and p.is_dir():
+        h = hashlib.sha256()
+        found_any = False
+        for rel in (
+            "text_encoder/config.json",
+            "config.json",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer_config.json",
+            "model_index.json",
+        ):
+            fp = p / rel
+            if fp.is_file() and not fp.is_symlink():
+                h.update(rel.encode("utf-8"))
+                h.update(hash_file_sha256(fp).encode("ascii"))
+                found_any = True
+        if found_any:
+            return f"local:{h.hexdigest()[:16]}"
+
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        for fname in ("text_encoder/config.json", "config.json", "model_index.json"):
+            cached = try_to_load_from_cache(text_model_id, fname)
+            if isinstance(cached, str) and "/snapshots/" in cached:
+                snap = cached.split("/snapshots/", 1)[1].split("/", 1)[0]
+                if snap:
+                    return f"hf:{snap}"
+    except Exception:
+        pass
+    return "default"
+
+
+def compute_embed_cache_key(
+    text_model_id: str,
+    prompt: str,
+    neg_prompt: str,
+    *,
+    encoder_revision: str = "default",
+    max_sequence_length: int = _DEFAULT_VACE_SEQ_LEN,
+    dtype_str: str = "torch.bfloat16",
+    expected_hidden_dim: int = _DEFAULT_VACE_HIDDEN_DIM,
+) -> str:
+    """Collision-free structured JSON hash key for cached prompt embeddings."""
+    payload = json.dumps(
+        {
+            "text_model_id": text_model_id,
+            "encoder_revision": str(encoder_revision),
+            "prompt": prompt,
+            "neg_prompt": neg_prompt,
+            "max_sequence_length": int(max_sequence_length),
+            "dtype": str(dtype_str),
+            "expected_hidden_dim": int(expected_hidden_dim),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
 def save_prompt_embeds_safetensors(
@@ -365,23 +456,29 @@ def save_prompt_embeds_safetensors(
     try:
         save_file(
             {
-                "prompt_embeds": prompt_embeds.contiguous().cpu(),
-                "negative_prompt_embeds": negative_prompt_embeds.contiguous().cpu(),
+                "prompt_embeds": prompt_embeds.detach().cpu().contiguous().clone(),
+                "negative_prompt_embeds": negative_prompt_embeds.detach().cpu().contiguous().clone(),
             },
             str(tmp_path),
         )
         os.replace(tmp_path, cache_path)
-    except Exception:
+    except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
 
 
-def load_prompt_embeds_safetensors(cache_path: Path) -> tuple[Any, Any] | None:
+def load_prompt_embeds_safetensors(
+    cache_path: Path,
+    *,
+    expected_batch_size: int = 1,
+    expected_seq_len: int = _DEFAULT_VACE_SEQ_LEN,
+    expected_hidden_dim: int = _DEFAULT_VACE_HIDDEN_DIM,
+) -> tuple[Any, Any] | None:
     """
     Load & strictly validate cached embeddings from Safetensors (returns None if invalid).
 
-    Validates exact expected keys, 3D floating-point tensor rank, finite entries, and
-    compatible batch/hidden dimensions.
+    Requires exact keys, 3D rank, exact `(batch_size=1, seq_len, hidden_dim)` matching the
+    target VACE transformer, supported floating dtype (`fp32/fp16/bf16`), and all finite values.
     """
     import torch
     from safetensors.torch import load_file
@@ -391,23 +488,72 @@ def load_prompt_embeds_safetensors(cache_path: Path) -> tuple[Any, Any] | None:
     try:
         tensors = load_file(str(cache_path), device="cpu")
     except Exception as exc:
-        logger.warning("Failed to load safetensors embed cache %s (%s); recomputing.", cache_path, exc)
+        logger.warning(
+            "Failed to load safetensors embed cache %s (%s); recomputing.", cache_path, exc
+        )
         return None
 
     if set(tensors.keys()) != {"prompt_embeds", "negative_prompt_embeds"}:
         logger.warning("Unexpected keys in embed cache %s; recomputing.", cache_path)
         return None
 
+    supported_dtypes = {torch.float32, torch.float16, torch.bfloat16}
+    expected_shape = (expected_batch_size, expected_seq_len, expected_hidden_dim)
+
     pe = tensors["prompt_embeds"]
     npe = tensors["negative_prompt_embeds"]
     for t in (pe, npe):
-        if t.ndim != 3 or t.numel() == 0 or not torch.is_floating_point(t):
+        if t.dtype not in supported_dtypes:
+            return None
+        if tuple(t.shape) != expected_shape:
             return None
         if not bool(torch.isfinite(t).all().item()):
             return None
-    if pe.shape[0] != npe.shape[0] or pe.shape[2] != npe.shape[2]:
-        return None
     return pe, npe
+
+
+def _load_text_encoder_pipeline(text_model_id: str, dtype: Any) -> Any:
+    """
+    Load UMT5 tokenizer & encoder from EITHER a full Diffusers repo (`model_index.json`) OR
+    a standalone Hugging Face UMT5 repository (`config.json` + tokenizer assets).
+    """
+    from diffusers import WanVACEPipeline
+
+    try:
+        return WanVACEPipeline.from_pretrained(
+            text_model_id,
+            transformer=None,
+            vae=None,
+            torch_dtype=dtype,
+        )
+    except (OSError, ValueError) as exc:
+        logger.info(
+            "Loading %s as standalone UMT5 encoder repository (%s).", text_model_id, exc
+        )
+        from transformers import AutoTokenizer, UMT5EncoderModel
+
+        tokenizer = AutoTokenizer.from_pretrained(text_model_id)
+        text_encoder = UMT5EncoderModel.from_pretrained(text_model_id, torch_dtype=dtype)
+        return WanVACEPipeline(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            vae=None,
+            transformer=None,
+            scheduler=None,
+        )
+
+
+def _resolve_expected_text_dim(model_id: str) -> int:
+    """Query transformer `text_dim` from config without downloading weights (fallback 4096)."""
+    try:
+        from diffusers import WanVACETransformer3DModel
+
+        cfg = WanVACETransformer3DModel.load_config(model_id, subfolder="transformer")
+        if isinstance(cfg, dict) and isinstance(cfg.get("text_dim"), int) and cfg["text_dim"] > 0:
+            return int(cfg["text_dim"])
+    except Exception:
+        pass
+    return _DEFAULT_VACE_HIDDEN_DIM
 
 
 def get_or_compute_prompt_embeds(
@@ -417,43 +563,61 @@ def get_or_compute_prompt_embeds(
     cache_dir: Path,
     device: Any,
     dtype: Any,
+    *,
+    max_sequence_length: int = _DEFAULT_VACE_SEQ_LEN,
+    expected_hidden_dim: int = _DEFAULT_VACE_HIDDEN_DIM,
 ) -> tuple[Any, Any]:
     """
     Stage 1 of 2-stage VRAM-safe VACE loading: compute UMT5 prompt embeddings,
-    atomically cache to Safetensors (no pickle/torch.load), and unload text_encoder.
+    atomically cache to validated Safetensors, and unload text_encoder.
     """
     import torch
-    from diffusers import WanVACEPipeline
 
     cache_dir = Path(cache_dir)
     reject_symlink_path(cache_dir, "embed_cache_dir")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha256(f"{text_model_id}\n{prompt}\n{neg_prompt}".encode()).hexdigest()[:16]
+    key = compute_embed_cache_key(
+        text_model_id,
+        prompt,
+        neg_prompt,
+        encoder_revision=_resolve_text_encoder_revision(text_model_id),
+        max_sequence_length=max_sequence_length,
+        dtype_str=str(dtype),
+        expected_hidden_dim=expected_hidden_dim,
+    )
     cache_path = cache_dir / f"vace_embeds_{key}.safetensors"
 
-    cached = load_prompt_embeds_safetensors(cache_path)
+    cached = load_prompt_embeds_safetensors(
+        cache_path,
+        expected_batch_size=1,
+        expected_seq_len=max_sequence_length,
+        expected_hidden_dim=expected_hidden_dim,
+    )
     if cached is not None:
         logger.info("Loaded validated Safetensors UMT5 prompt embeddings from %s", cache_path)
         return cached
 
     logger.info("Encoding prompt with UMT5 (%s)...", text_model_id)
-    pipe_txt = WanVACEPipeline.from_pretrained(
-        text_model_id,
-        transformer=None,
-        vae=None,
-        torch_dtype=dtype,
-    )
+    pipe_txt = _load_text_encoder_pipeline(text_model_id, dtype)
     pipe_txt.text_encoder.to(device)
     with torch.inference_mode():
         pe, npe = pipe_txt.encode_prompt(
             prompt=prompt,
             negative_prompt=neg_prompt,
             do_classifier_free_guidance=True,
-            max_sequence_length=512,
+            max_sequence_length=max_sequence_length,
             device=device,
             dtype=dtype,
         )
     pe_cpu, npe_cpu = pe.cpu(), npe.cpu()
+    if pe_cpu.shape[-1] != expected_hidden_dim or npe_cpu.shape[-1] != expected_hidden_dim:
+        del pipe_txt, pe, npe
+        gc.collect()
+        cuda_empty_cache_if_needed(torch, device)
+        raise ValueError(
+            f"Text encoder {text_model_id!r} produced hidden width {pe_cpu.shape[-1]}, "
+            f"which does not match target VACE transformer text_dim={expected_hidden_dim}."
+        )
     save_prompt_embeds_safetensors(cache_path, pe_cpu, npe_cpu)
 
     del pipe_txt, pe, npe
@@ -462,17 +626,33 @@ def get_or_compute_prompt_embeds(
     return pe_cpu, npe_cpu
 
 
-def _validate_quantization_prereqs(quantize_4bit: bool, device: Any) -> None:
-    """Validate 4-bit quantization prerequisites BEFORE allocating UMT5 or VAE memory."""
+def _validate_quantization_prereqs(quantize_4bit: bool, device: Any, dtype: Any = None) -> None:
+    """
+    Validate native CUDA NF4 bitsandbytes execution on `device` BEFORE allocating UMT5 or VAE.
+
+    Catches CPU-only bitsandbytes builds and broken native CUDA libraries up front.
+    """
     if not quantize_4bit:
         return
     if getattr(device, "type", "") != "cuda":
-        raise RuntimeError("--quantize-4bit requires a CUDA GPU and bitsandbytes.")
+        raise RuntimeError("--quantize-4bit requires a CUDA GPU and CUDA-enabled bitsandbytes.")
     try:
-        import bitsandbytes  # noqa: F401
+        import bitsandbytes as bnb
+        import torch
     except ImportError as exc:
         raise RuntimeError(
             "--quantize-4bit requires bitsandbytes (`pip install 'eyeglass-glare-removal[quant]'`)."
+        ) from exc
+
+    try:
+        probe_dtype = dtype if dtype is not None else torch.bfloat16
+        probe = torch.zeros((16, 16), device=device, dtype=probe_dtype)
+        q, state = bnb.functional.quantize_4bit(probe, quant_type="nf4")
+        _ = bnb.functional.dequantize_4bit(q, state, quant_type="nf4")
+        del probe, q, state
+    except Exception as exc:
+        raise RuntimeError(
+            f"--quantize-4bit native CUDA NF4 preflight failed on {device}: {exc}"
         ) from exc
 
 
@@ -493,7 +673,7 @@ def load_vace_denoiser(
     )
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
-    _validate_quantization_prereqs(quantize_4bit, device)
+    _validate_quantization_prereqs(quantize_4bit, device, dtype)
 
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True
@@ -546,17 +726,13 @@ def run_inpaint_chunks(
     ref_image_paths: list[Path] | None = None,
     resume: bool = True,
     chunk_infer_fn: Any = None,
+    prep_generation: str | None = None,
+    segment_generation: str | None = None,
+    roi_frames_digest: str | None = None,
+    masks_digest: str | None = None,
 ) -> dict[str, Any]:
     """
     Execute Stage 4 resumable chunked inpainting + raised-cosine overlap blending.
-
-    - Content-bound fingerprinting across ROI frames, glare masks, clamp masks, refs, and config.
-    - Lazy model loading: UMT5, VAE, and DiT are ONLY loaded if at least one pending chunk
-      has non-empty glare masks (zero-glare clips never load VACE!).
-    - Validates quantization prerequisites before allocating UMT5/VAE.
-    - Tracks per-frame edit support so clean frames are copied bit-for-bit without resampling
-      or overlap blending from VACE.
-    - Unique temp dirs/files and strict per-frame SHA-256 + decode checkpoint validation.
     """
     if not frame_paths:
         raise ValueError("frame_paths must be non-empty.")
@@ -628,11 +804,14 @@ def run_inpaint_chunks(
 
             configure_sdpa_guard(torch)
             device = resolve_torch_device(torch, config.device)
-            _validate_quantization_prereqs(config.quantize_4bit, device)
             dtype = preferred_inference_dtype(torch, device)
+            # Validate native CUDA NF4 backend BEFORE allocating UMT5 or VAE!
+            _validate_quantization_prereqs(config.quantize_4bit, device, dtype)
+
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
 
+            expected_dim = _resolve_expected_text_dim(config.model_id)
             cache_dir = config.embed_cache_dir or (inpaint_dir / "embed_cache")
             pe_cpu, npe_cpu = get_or_compute_prompt_embeds(
                 config.text_encoder_model_id or config.model_id,
@@ -641,6 +820,8 @@ def run_inpaint_chunks(
                 cache_dir,
                 device,
                 dtype,
+                max_sequence_length=_DEFAULT_VACE_SEQ_LEN,
+                expected_hidden_dim=expected_dim,
             )
             pipe = load_vace_denoiser(
                 config.model_id,
@@ -649,6 +830,14 @@ def run_inpaint_chunks(
                 dtype=dtype,
                 flow_shift=config.flow_shift,
             )
+            # Final defense-in-depth check against loaded transformer text_dim
+            actual_dim = getattr(getattr(pipe, "transformer", None), "config", None)
+            t_dim = getattr(actual_dim, "text_dim", expected_dim)
+            if pe_cpu.shape[-1] != t_dim or npe_cpu.shape[-1] != t_dim:
+                raise ValueError(
+                    f"Prompt embedding hidden width {pe_cpu.shape[-1]} != transformer text_dim {t_dim}"
+                )
+
             model_state.update(
                 {
                     "loaded": True,
@@ -719,7 +908,6 @@ def run_inpaint_chunks(
                                 "sec": round(dt, 2),
                             }
                         else:
-                            # Lazy model load happens ONLY when a chunk actually requires inpainting!
                             _ensure_vace_loaded()
 
                             f_in, valid_n = pad_sequence_4k1(frames_pil)
@@ -765,10 +953,11 @@ def run_inpaint_chunks(
                             for li in range(L):
                                 dst_p = tmp_dir / f"{li:04d}.png"
                                 if not chunk_frame_has_edit[li]:
-                                    # Clean frame inside a mixed chunk: preserve original ROI bit-for-bit
                                     shutil.copyfile(frame_paths[s + li], dst_p)
                                 else:
-                                    im = Image.fromarray((out_arr[li] * 255.0).round().astype(np.uint8))
+                                    im = Image.fromarray(
+                                        (out_arr[li] * 255.0).round().astype(np.uint8)
+                                    )
                                     if im.size != orig_sz:
                                         im = im.resize(orig_sz, Image.Resampling.LANCZOS)
                                     im.save(dst_p)
@@ -793,7 +982,7 @@ def run_inpaint_chunks(
 
                         atomic_write_text(tmp_dir / "done.json", json.dumps(meta, indent=2))
                         atomic_swap_directory(tmp_dir, cdir)
-                    except Exception:
+                    except BaseException:
                         if tmp_dir.exists():
                             shutil.rmtree(tmp_dir, ignore_errors=True)
                         raise
@@ -825,41 +1014,45 @@ def run_inpaint_chunks(
                 if torch_mod is not None:
                     cuda_empty_cache_if_needed(torch_mod, device)
 
-    # Collect per-frame edit flags across all completed chunks so clean frames bypass overlap blend
     frame_has_edit_global = [False] * n
     for ci, (s, e) in enumerate(chunks):
-        meta = json.loads((chunks_root / f"chunk_{ci:04d}" / "done.json").read_text(encoding="utf-8"))
+        meta = json.loads(
+            (chunks_root / f"chunk_{ci:04d}" / "done.json").read_text(encoding="utf-8")
+        )
         chunk_flags = meta.get("frame_has_edit") or [True] * (e - s)
         for li in range(e - s):
             if bool(chunk_flags[li]):
                 frame_has_edit_global[s + li] = True
 
-    stream_blend_chunks(
+    stage_roi_dir, cleaned_roi_digest = _stage_blend_chunks(
         [p.name for p in frame_paths],
         chunks,
         chunks_root,
-        out_roi_dir,
+        inpaint_dir,
         orig_frame_paths=frame_paths,
         frame_has_edit=frame_has_edit_global,
     )
-    atomic_write_text(
-        inpaint_dir / "edit_support.json",
-        json.dumps(
-            {
-                "config_fingerprint": fingerprint,
-                "inputs_digest": inputs_digest,
-                "num_frames": n,
-                "frame_has_edit": frame_has_edit_global,
-            },
-            indent=2,
-        ),
-    )
-
+    edit_support_payload = {
+        "prep_generation": prep_generation,
+        "segment_generation": segment_generation,
+        "roi_frames_digest": roi_frames_digest,
+        "masks_digest": masks_digest,
+        "inpaint_generation": fingerprint,
+        "config_fingerprint": fingerprint,
+        "inputs_digest": inputs_digest,
+        "cleaned_roi_digest": cleaned_roi_digest,
+        "num_frames": n,
+        "frame_has_edit": frame_has_edit_global,
+    }
     summary = {
         "model_id": config.model_id,
         "quantize_4bit": config.quantize_4bit,
+        "prep_generation": prep_generation,
+        "segment_generation": segment_generation,
+        "inpaint_generation": fingerprint,
         "config_fingerprint": fingerprint,
         "inputs_digest": inputs_digest,
+        "cleaned_roi_digest": cleaned_roi_digest,
         "steps": config.steps,
         "guidance_scale": config.guidance_scale,
         "conditioning_scale": config.conditioning_scale,
@@ -875,5 +1068,33 @@ def run_inpaint_chunks(
         "total_wall_min": round((time.time() - t_wall0) / 60.0, 2),
         "out_roi_dir": str(out_roi_dir),
     }
-    atomic_write_text(inpaint_dir / "inpaint_summary.json", json.dumps(summary, indent=2))
+
+    edit_dest = inpaint_dir / "edit_support.json"
+    summary_dest = inpaint_dir / "inpaint_summary.json"
+    tmp_edit = make_unique_temp_sibling(edit_dest)
+    tmp_summary = make_unique_temp_sibling(summary_dest)
+    try:
+        with open(tmp_edit, "w", encoding="utf-8") as f:
+            f.write(json.dumps(edit_support_payload, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        with open(tmp_summary, "w", encoding="utf-8") as f:
+            f.write(json.dumps(summary, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+
+        atomic_commit_paths(
+            [
+                (stage_roi_dir, out_roi_dir),
+                (tmp_edit, edit_dest),
+                (tmp_summary, summary_dest),
+            ]
+        )
+    except BaseException:
+        if stage_roi_dir.exists():
+            shutil.rmtree(stage_roi_dir, ignore_errors=True)
+        tmp_edit.unlink(missing_ok=True)
+        tmp_summary.unlink(missing_ok=True)
+        raise
+
     return summary

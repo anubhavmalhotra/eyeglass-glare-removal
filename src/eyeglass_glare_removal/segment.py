@@ -56,6 +56,24 @@ def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter) / float(union)
 
 
+def _lens_pair_iou(prev_m: np.ndarray, cand_m: np.ndarray) -> tuple[float, bool]:
+    """
+    Compare a single lens mask across chunks, explicitly distinguishing mutual absence
+    (both empty during an occlusion -> `(1.0, True)`) from tracking collapse (`(0.0, False)`).
+    """
+    a_b = prev_m > 0
+    b_b = cand_m > 0
+    a_any = bool(a_b.any())
+    b_any = bool(b_b.any())
+    if not a_any and not b_any:
+        return 1.0, True
+    if not a_any or not b_any:
+        return 0.0, False
+    inter = int((a_b & b_b).sum())
+    union = int((a_b | b_b).sum())
+    return float(inter) / float(max(1, union)), False
+
+
 def compute_sam2_chunk_ranges(
     n_frames: int, chunk_size: int = 280, overlap: int = 10
 ) -> list[tuple[int, int]]:
@@ -323,24 +341,76 @@ def derive_prompts_from_masks(
     return _build_one(ml, is_left=True), _build_one(mr, is_left=False)
 
 
-def _capped_sdf(mask_u8: np.ndarray, max_sdf: float = 6.0) -> tuple[np.ndarray | None, bool]:
+def _capped_sdf_entry(
+    mask_u8: np.ndarray, max_sdf: float = 6.0
+) -> tuple[np.ndarray | None, np.ndarray, bool]:
     """
-    Compute a safely capped signed distance field in [-max_sdf, +max_sdf].
+    Compute `(capped_sdf_or_None, binary_bool, is_valid)` for consistency-gated temporal smoothing.
 
-    Explicitly handles empty masks (returns (None, True)) and all-foreground masks
-    (returns constant +max_sdf) so OpenCV distanceTransform never receives an all-ones
-    mask and produces extreme unnormalized distances that wipe neighboring frames.
+    Treats BOTH empty masks (`fg == 0`) AND anomalous full-ROI outlier masks (`fg >= 0.85 * size`)
+    as invalid (`is_valid = False`) so neither empty dropouts nor blown-out full masks can erase
+    or expand valid neighboring lens masks.
     """
-    b = (mask_u8 > 127).astype(np.uint8)
-    fg = int(b.sum())
-    if fg == 0:
-        return None, True
-    if fg == b.size:
-        return np.full(b.shape, max_sdf, dtype=np.float32), False
-    d_in = cv2.distanceTransform(b, cv2.DIST_L2, 5)
-    d_out = cv2.distanceTransform(1 - b, cv2.DIST_L2, 5)
+    b_bool = mask_u8 > 127
+    fg = int(b_bool.sum())
+    if fg == 0 or fg >= int(0.85 * b_bool.size):
+        return None, b_bool, False
+    b_u8 = b_bool.astype(np.uint8)
+    d_in = cv2.distanceTransform(b_u8, cv2.DIST_L2, 5)
+    d_out = cv2.distanceTransform(1 - b_u8, cv2.DIST_L2, 5)
     sdf = np.clip(d_in - d_out, -max_sdf, max_sdf).astype(np.float32)
-    return sdf, False
+    return sdf, b_bool, True
+
+
+def _resolve_consistent_window_mask(
+    buf: dict[int, tuple[np.ndarray | None, np.ndarray, bool]],
+    i: int,
+    lo: int,
+    hi: int,
+    *,
+    radius: int,
+    min_consistency_iou: float = 0.50,
+) -> np.ndarray:
+    """
+    Resolve frame `i` from a bounded window buffer of `(sdf, mask_bool, is_valid)` entries:
+    - Valid current frame `i`: average only neighbors `j` that are valid AND spatially agree
+      with frame `i` (`mask_iou >= 0.50`), so motion, missing neighbors, or full-ROI outliers
+      can NEVER erase or expand a valid mask.
+    - Invalid/empty current frame `i`: bridge/interpolate ONLY when immediately flanking frames
+      `i - 1` and `i + 1` BOTH exist, are valid, and agree spatially (`mask_iou >= 0.50`).
+    """
+    sdf_i, b_i, valid_i = buf[i]
+    if radius <= 0:
+        return b_i.astype(np.uint8) * 255
+
+    if valid_i and sdf_i is not None:
+        agreeing = [sdf_i]
+        for j in range(lo, hi):
+            if j == i:
+                continue
+            sdf_j, b_j, valid_j = buf[j]
+            if valid_j and sdf_j is not None and mask_iou(b_i, b_j) >= min_consistency_iou:
+                agreeing.append(sdf_j)
+        if len(agreeing) == 1:
+            return b_i.astype(np.uint8) * 255
+        avg_sdf = sum(agreeing) / float(len(agreeing))
+        return (avg_sdf > 0.0).astype(np.uint8) * 255
+
+    # Invalid/empty/full-outlier frame: bridge isolated anomaly ONLY when flanking valid frames agree
+    if (i - 1) in buf and (i + 1) in buf:
+        sdf_prev, b_prev, valid_prev = buf[i - 1]
+        sdf_next, b_next, valid_next = buf[i + 1]
+        if (
+            valid_prev
+            and valid_next
+            and sdf_prev is not None
+            and sdf_next is not None
+            and mask_iou(b_prev, b_next) >= min_consistency_iou
+        ):
+            avg_sdf = 0.5 * (sdf_prev + sdf_next)
+            return (avg_sdf > 0.0).astype(np.uint8) * 255
+
+    return b_i.astype(np.uint8) * 255
 
 
 def iter_temporal_smoothed_masks(
@@ -349,14 +419,7 @@ def iter_temporal_smoothed_masks(
     radius: int = 1,
     max_sdf: float = 6.0,
 ) -> Iterator[np.ndarray]:
-    """
-    O(1)-RAM streaming majority-gated capped-SDF temporal binary mask smoother.
-
-    Holds at most `2 * radius + 1` frames in memory at any instant.
-    - Isolated 1-frame empty dropouts do NOT erase or shrink valid neighboring frames.
-    - Genuine empty regions (majority empty in window) remain empty.
-    - Handles all-empty and all-full masks explicitly without OpenCV distanceTransform overflow.
-    """
+    """O(1)-RAM streaming consistency-gated temporal binary mask smoother."""
     if n_frames <= 0:
         return
     if radius <= 0 or n_frames < 3:
@@ -364,41 +427,28 @@ def iter_temporal_smoothed_masks(
             yield ((m > 127).astype(np.uint8) * 255)
         return
 
-    buf: dict[int, tuple[np.ndarray | None, bool, tuple[int, int]]] = {}
+    buf: dict[int, tuple[np.ndarray | None, np.ndarray, bool]] = {}
     next_read = 0
 
     def _ensure_loaded(up_to_excl: int) -> None:
         nonlocal next_read
         while next_read < up_to_excl and next_read < n_frames:
             m = next(mask_stream)
-            sdf, is_empty = _capped_sdf(m, max_sdf=max_sdf)
-            buf[next_read] = (sdf, is_empty, (m.shape[0], m.shape[1]))
+            buf[next_read] = _capped_sdf_entry(m, max_sdf=max_sdf)
             next_read += 1
 
     for i in range(n_frames):
         lo = max(0, i - radius)
         hi = min(n_frames, i + radius + 1)
         _ensure_loaded(hi)
-
-        window_len = hi - lo
-        valid_sdfs = [buf[j][0] for j in range(lo, hi) if not buf[j][1] and buf[j][0] is not None]
-        shape = buf[i][2]
-
-        # Majority-gated: if majority of window is empty, keep empty; else smooth over valid masks
-        if len(valid_sdfs) * 2 < window_len or not valid_sdfs:
-            yield np.zeros(shape, dtype=np.uint8)
-        else:
-            avg_sdf = sum(valid_sdfs) / float(len(valid_sdfs))
-            yield (avg_sdf > 0.0).astype(np.uint8) * 255
-
-        # Evict frames outside the sliding window to maintain O(1) RAM
+        yield _resolve_consistent_window_mask(buf, i, lo, hi, radius=radius)
         for k in list(buf.keys()):
             if k < i - radius:
                 del buf[k]
 
 
 def temporal_smooth_binary_masks(masks: list[np.ndarray], radius: int = 1) -> list[np.ndarray]:
-    """Smooth a list of binary masks temporally via majority-gated capped SDF window."""
+    """Smooth a list of binary masks temporally via consistency-gated capped SDF window."""
     return list(iter_temporal_smoothed_masks(iter(masks), len(masks), radius=radius))
 
 
@@ -464,19 +514,7 @@ def compute_glare_hotspot_mask(
     feather_sigma: float = 2.0,
     sensitivity: float = 1.0,
 ) -> np.ndarray:
-    """
-    General photometric glare detector strictly inside `lens_interior`.
-
-    Detects:
-      1) Bright specular & low-saturation neutral reflections
-      2) Broad uniform/washed-out neutral glare over darker skin tones (distinguished from
-         small natural sclera lobes via per-lens connected-component area fraction)
-      3) Cool bluish-white screen reflections
-      4) Warm incandescent / orange-red lamp reflections
-      5) Green/cyan and purple/violet/magenta AR-coating reflections
-
-    Guarantees output is strictly 0 everywhere outside `lens_interior`.
-    """
+    """General photometric glare detector strictly inside `lens_interior`."""
     inside = lens_interior > 127
     if int(inside.sum()) == 0:
         return np.zeros(lens_interior.shape[:2], dtype=np.uint8)
@@ -502,16 +540,12 @@ def compute_glare_hotspot_mask(
     skin_b = stats["b_med"]
     skin_b_mad = stats["b_mad"]
 
-    # 1) Bright specular & low-saturation neutral washout
     bright_spec_thresh = min(242.0, max(skin_L85 + 26.0 * scale, 202.0 - 10.0 * (1.0 - scale)))
     washout_L_thresh = min(234.0, max(skin_L85 + 34.0 * scale, 194.0 - 8.0 * (1.0 - scale)))
     bright_specular = (L >= bright_spec_thresh) | (
         (L >= washout_L_thresh) & (chroma <= 15.0 / max(0.5, scale))
     )
 
-    # 2) Broad neutral washed-out reflection over dark/medium skin (e.g. RGB 175 sheet filling lens)
-    #    Natural sclera forms small lobes (< 10% of lens area) adjacent to dark iris;
-    #    a broad neutral reflection spans >= 12% of a lens component with strong luminance jump.
     broad_neutral = np.zeros(inside.shape, dtype=bool)
     broad_cand = (
         (L >= max(155.0, skin_L85 + 52.0 * scale))
@@ -535,14 +569,12 @@ def compute_glare_hotspot_mask(
                 if int(c_stats[cid, cv2.CC_STAT_AREA]) >= max(24, int(0.12 * lens_area)):
                     broad_neutral |= c_labels == cid
 
-    # 3) Cool / bluish screen reflection
     cool_b_thresh = min(skin_b - 10.0 * scale, 125.0)
     cool_screen = (
         ((b <= cool_b_thresh) & (L >= max(65.0, skin_L + 8.0 * scale)))
         | (((B - R) >= 6.0 * scale) & (L >= max(85.0, skin_L + 8.0 * scale)))
     )
 
-    # 4) Warm orange/amber/red lamp reflection
     warm_a_delta = max(6.0, 2.2 * skin_a_mad) * scale
     warm_b_delta = max(10.0, 2.5 * skin_b_mad) * scale
     warm_lamp = (
@@ -550,14 +582,12 @@ def compute_glare_hotspot_mask(
         | ((b >= skin_b + warm_b_delta) & (a >= skin_a + 3.0 * scale) & (L >= skin_L + 8.0 * scale))
     )
 
-    # 5) Green / cyan AR-coating reflection
     ar_min_L = max(48.0, skin_L - 25.0)
     green_ar = (
         ((a <= min(skin_a - 10.0 * scale, 123.0)) & (L >= ar_min_L))
         | (((G - R) >= 10.0 * scale) & ((G - B) >= 6.0 * scale) & (L >= 52.0))
     )
 
-    # 6) Purple / violet / magenta AR-coating reflection
     purple_ar = (
         ((b <= min(skin_b - 12.0 * scale, 122.0)) & (a >= 131.0) & (L >= ar_min_L))
         | ((np.minimum(R - G, B - G) >= 12.0 * scale) & (L >= 52.0))
@@ -684,6 +714,15 @@ def _run_sam2_single_chunk(
     )
 
 
+def _hash_overlap_masks(left_ov: list[np.ndarray], right_ov: list[np.ndarray]) -> str:
+    """Content digest of the predecessor overlap masks seeding a downstream SAM2 chunk."""
+    h = hashlib.sha256()
+    for ml, mr in zip(left_ov, right_ov, strict=True):
+        h.update(np.ascontiguousarray(ml.astype(np.bool_)).tobytes())
+        h.update(np.ascontiguousarray(mr.astype(np.bool_)).tobytes())
+    return h.hexdigest()[:16]
+
+
 def _save_chunk_npz_atomic(
     ckpt_path: Path,
     left_masks: list[np.ndarray],
@@ -703,8 +742,8 @@ def _save_chunk_npz_atomic(
         with os.fdopen(fd, "wb") as f:
             np.savez_compressed(
                 f,
-                left=np.stack(left_masks, axis=0),
-                right=np.stack(right_masks, axis=0),
+                left=np.stack(left_masks, axis=0).astype(np.bool_),
+                right=np.stack(right_masks, axis=0).astype(np.bool_),
                 iou_l=np.float32(iou_l),
                 iou_r=np.float32(iou_r),
                 used_fallback=np.bool_(used_fallback),
@@ -713,7 +752,7 @@ def _save_chunk_npz_atomic(
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, ckpt_path)
-    except Exception:
+    except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
 
@@ -734,8 +773,8 @@ def _evaluate_chunk_handoff(
     splice_i: int,
 ) -> dict[str, Any]:
     """
-    Verify per-lens IoU across the overlap (seed, splice, and full overlap) AND detect
-    left/right identity swaps around the actual splice point.
+    Verify per-lens IoU across seed AND post-seed overlap frames (including splice_i),
+    detecting left/right identity swaps while handling mutual occlusion (both empty) cleanly.
     """
     ov_len = min(len(prev_l_ov), len(cand_l_ov))
     if ov_len == 0:
@@ -748,25 +787,34 @@ def _evaluate_chunk_handoff(
             "swapped": False,
         }
 
-    s_idx = min(max(0, splice_i), ov_len - 1)
-    l_ious = [mask_iou(prev_l_ov[k], cand_l_ov[k]) for k in range(ov_len)]
-    r_ious = [mask_iou(prev_r_ov[k], cand_r_ov[k]) for k in range(ov_len)]
-    cross_lr = [mask_iou(prev_l_ov[k], cand_r_ov[k]) for k in range(ov_len)]
-    cross_rl = [mask_iou(prev_r_ov[k], cand_l_ov[k]) for k in range(ov_len)]
+    s_idx = min(max(1 if ov_len >= 2 else 0, splice_i), ov_len - 1)
+    l_ious: list[float] = []
+    r_ious: list[float] = []
+    cross_lr: list[float] = []
+    cross_rl: list[float] = []
+
+    for k in range(ov_len):
+        li, l_both_empty = _lens_pair_iou(prev_l_ov[k], cand_l_ov[k])
+        ri, r_both_empty = _lens_pair_iou(prev_r_ov[k], cand_r_ov[k])
+        l_ious.append(li)
+        r_ious.append(ri)
+        # Only score cross-swap on non-empty lenses (two empty lenses aren't swapped!)
+        clr = 0.0 if (l_both_empty or r_both_empty) else mask_iou(prev_l_ov[k], cand_r_ov[k])
+        crl = 0.0 if (l_both_empty or r_both_empty) else mask_iou(prev_r_ov[k], cand_l_ov[k])
+        cross_lr.append(clr)
+        cross_rl.append(crl)
 
     splice_l = l_ious[s_idx]
     splice_r = r_ious[s_idx]
-    splice_clr = cross_lr[s_idx]
-    splice_crl = cross_rl[s_idx]
+    post_start = 1 if ov_len >= 2 else 0
 
-    # Identity swap detected if cross-overlap beats direct overlap at splice or across overlap
     swapped = (
-        (splice_clr > splice_l + 0.05)
-        or (splice_crl > splice_r + 0.05)
-        or (float(np.mean(cross_lr)) > float(np.mean(l_ious)) + 0.05)
-        or (float(np.mean(cross_rl)) > float(np.mean(r_ious)) + 0.05)
+        (cross_lr[s_idx] > splice_l + 0.05)
+        or (cross_rl[s_idx] > splice_r + 0.05)
+        or any(cross_lr[k] > l_ious[k] + 0.05 for k in range(post_start, ov_len))
+        or any(cross_rl[k] > r_ious[k] + 0.05 for k in range(post_start, ov_len))
     )
-    min_iou = min(l_ious[0], r_ious[0], splice_l, splice_r, min(l_ious), min(r_ious))
+    min_iou = min(min(l_ious), min(r_ious))
     return {
         "iou_l": splice_l,
         "iou_r": splice_r,
@@ -796,11 +844,10 @@ def run_chunked_tracking_loop(
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[dict[str, Any]]]:
     """
     Chunk-orchestration engine for SAM2.1 tracking with:
-    - Safe zero-overlap handling (independent re-seeding) AND multi-frame overlap verification
-      with explicit identity-swap rejection at the actual splice point.
-    - Automatic OOM retry halving chunk length cleanly.
-    - Atomic unique-temp `.npz` checkpoints with fingerprint validation.
-    - Optional disk-only mode (`store_in_memory=False`, requiring `ckpt_dir`) for O(1) host RAM.
+    - Post-seed identity-swap verification (requiring `overlap == 0` or `overlap >= 2`).
+    - Mutual-occlusion agreement handling & graceful re-seeding when visibility returns.
+    - Dynamic OOM backoff shrinking BOTH chunk size AND effective overlap cleanly.
+    - Predecessor-mask-bound chunk fingerprints and single-decompression `.npz` loading.
     """
     if not store_in_memory and ckpt_dir is None:
         raise ValueError("store_in_memory=False requires ckpt_dir.")
@@ -809,7 +856,13 @@ def run_chunked_tracking_loop(
     if chunk_size < 2:
         raise ValueError(f"chunk_size must be >= 2, got {chunk_size}")
     if overlap < 0 or overlap >= chunk_size:
-        raise ValueError(f"overlap must satisfy 0 <= overlap < chunk_size ({chunk_size}), got {overlap}")
+        raise ValueError(
+            f"overlap must satisfy 0 <= overlap < chunk_size ({chunk_size}), got {overlap}"
+        )
+    if n_frames > chunk_size and overlap == 1:
+        raise ValueError(
+            "overlap=1 cannot verify post-seed lens identity; pass overlap=0 (disjoint) or overlap >= 2."
+        )
 
     left_all: list[np.ndarray | None] = [None] * n_frames if store_in_memory else []
     right_all: list[np.ndarray | None] = [None] * n_frames if store_in_memory else []
@@ -821,12 +874,15 @@ def run_chunked_tracking_loop(
 
     fallback_pair = (init_left_prompts, init_right_prompts)
 
-    # Keep only the previous chunk's overlap tail in RAM so even long videos stay O(1) RAM!
+    prev_end: int = 0
     prev_tail_start: int | None = None
     prev_tail_l: list[np.ndarray] = []
     prev_tail_r: list[np.ndarray] = []
 
+    min_ov = 2 if overlap > 0 else 0
+    min_chunk_len = min_ov + 2
     cur_chunk_size = chunk_size
+    cur_overlap = overlap
     cs = 0
     c_idx = 0
 
@@ -835,6 +891,17 @@ def run_chunked_tracking_loop(
         chunk_len = ce - cs
         tc = time.time()
 
+        actual_ov = 0 if c_idx == 0 else max(0, prev_end - cs)
+        prev_l_ov: list[np.ndarray] = []
+        prev_r_ov: list[np.ndarray] = []
+        handoff_dep_digest = "seed"
+        if c_idx > 0 and actual_ov > 0 and prev_tail_start is not None:
+            ov_offset = cs - prev_tail_start
+            prev_l_ov = prev_tail_l[ov_offset : ov_offset + actual_ov]
+            prev_r_ov = prev_tail_r[ov_offset : ov_offset + actual_ov]
+            handoff_dep_digest = _hash_overlap_masks(prev_l_ov, prev_r_ov)
+
+        chunk_fp = f"{fingerprint}:{handoff_dep_digest}" if fingerprint else handoff_dep_digest
         ckpt_p = (
             ckpt_dir / f"{ckpt_prefix}_{c_idx:04d}_{cs:06d}_{ce:06d}.npz"
             if ckpt_dir is not None
@@ -850,30 +917,36 @@ def run_chunked_tracking_loop(
 
         if resume and ckpt_p is not None and ckpt_p.exists() and not ckpt_p.is_symlink():
             try:
-                with np.load(ckpt_p) as data:
+                with np.load(ckpt_p, allow_pickle=False) as data:
                     stored_fp = str(data["fingerprint"].item()) if "fingerprint" in data else ""
-                    fp_ok = (not fingerprint) or (stored_fp == fingerprint)
-                    if (
-                        fp_ok
-                        and data["left"].shape[0] == chunk_len
-                        and data["right"].shape[0] == chunk_len
-                    ):
-                        c_left = [data["left"][i].astype(bool) for i in range(chunk_len)]
-                        c_right = [data["right"][i].astype(bool) for i in range(chunk_len)]
-                        handoff_iou_l = float(data["iou_l"]) if "iou_l" in data else 1.0
-                        handoff_iou_r = float(data["iou_r"]) if "iou_r" in data else 1.0
-                        used_fallback = bool(data["used_fallback"]) if "used_fallback" in data else False
-                        loaded_from_ckpt = True
+                    if stored_fp == chunk_fp:
+                        # Load compressed arrays ONCE outside the loop (never re-decompress per frame!)
+                        left_np = data["left"]
+                        right_np = data["right"]
+                        if (
+                            left_np.ndim == 3
+                            and right_np.ndim == 3
+                            and left_np.shape == right_np.shape
+                            and left_np.shape[0] == chunk_len
+                            and left_np.dtype == np.bool_
+                            and right_np.dtype == np.bool_
+                        ):
+                            c_left = [left_np[i] for i in range(chunk_len)]
+                            c_right = [right_np[i] for i in range(chunk_len)]
+                            handoff_iou_l = float(data["iou_l"]) if "iou_l" in data else 1.0
+                            handoff_iou_r = float(data["iou_r"]) if "iou_r" in data else 1.0
+                            used_fallback = (
+                                bool(data["used_fallback"]) if "used_fallback" in data else False
+                            )
+                            loaded_from_ckpt = True
             except Exception as exc:
                 logger.warning("Corrupt SAM2 chunk checkpoint %s (%s); recomputing.", ckpt_p, exc)
 
         if not loaded_from_ckpt:
             try:
                 chunk_frames = [frame_loader(i) for i in range(cs, ce)]
-                actual_ov = 0 if c_idx == 0 else max(0, (prev_tail_start or 0) + len(prev_tail_l) - cs)
 
                 if c_idx == 0 or actual_ov == 0:
-                    # First chunk or zero-overlap disjoint chunk -> seed cleanly from initial prompts
                     c_left, c_right = chunk_runner(
                         chunk_frames,
                         left_prompts=init_left_prompts,
@@ -881,13 +954,9 @@ def run_chunked_tracking_loop(
                         init_masks=None,
                     )
                 else:
-                    assert prev_tail_start is not None
-                    ov_offset = cs - prev_tail_start
-                    prev_l_ov = prev_tail_l[ov_offset : ov_offset + actual_ov]
-                    prev_r_ov = prev_tail_r[ov_offset : ov_offset + actual_ov]
                     prev_l0 = prev_l_ov[0]
                     prev_r0 = prev_r_ov[0]
-                    splice_i = actual_ov // 2
+                    splice_i = max(1 if actual_ov >= 2 else 0, actual_ov // 2)
 
                     lp, rp = derive_prompts_from_masks(
                         prev_l0, prev_r0, fallback_prompts=fallback_pair
@@ -921,13 +990,14 @@ def run_chunked_tracking_loop(
                             prev_l_ov, prev_r_ov, fb_left[:actual_ov], fb_right[:actual_ov], splice_i
                         )
 
-                        # Select strictly non-swapped better candidate; if both fail, reject swap
                         candidates = [
                             (not ev1["swapped"], ev1["min_iou"], False, c_left, c_right, ev1),
                             (not ev2["swapped"], ev2["min_iou"], True, fb_left, fb_right, ev2),
                         ]
                         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-                        best_non_swapped, best_min_iou, best_fb, c_left, c_right, best_ev = candidates[0]
+                        best_non_swapped, best_min_iou, best_fb, c_left, c_right, best_ev = (
+                            candidates[0]
+                        )
                         used_fallback = best_fb
                         handoff_iou_l = best_ev["iou_l"]
                         handoff_iou_r = best_ev["iou_r"]
@@ -954,27 +1024,39 @@ def run_chunked_tracking_loop(
                         handoff_iou_l,
                         handoff_iou_r,
                         used_fallback,
-                        fingerprint=fingerprint,
+                        fingerprint=chunk_fp,
                     )
             except Exception as exc:
-                min_allowed = max(overlap + 2, 8)
-                if _is_oom_error(exc) and cur_chunk_size > min_allowed:
-                    new_sz = max(min_allowed, cur_chunk_size // 2)
+                if _is_oom_error(exc) and cur_chunk_size > min_chunk_len:
+                    new_sz = max(min_chunk_len, cur_chunk_size // 2)
+                    if new_sz >= cur_chunk_size:
+                        new_sz = cur_chunk_size - 1
+                    new_ov = (
+                        min(cur_overlap, max(min_ov, new_sz // 4)) if overlap > 0 else 0
+                    )
+                    if new_ov >= new_sz:
+                        new_ov = max(0, new_sz - 2)
                     logger.warning(
-                        "CUDA OOM on SAM2 chunk [%d:%d] (size=%d); retrying with chunk_size=%d.",
+                        "CUDA OOM on SAM2 chunk [%d:%d] (size=%d, ov=%d); retrying with size=%d, ov=%d.",
                         cs,
                         ce,
                         cur_chunk_size,
+                        cur_overlap,
                         new_sz,
+                        new_ov,
                     )
                     cur_chunk_size = new_sz
+                    cur_overlap = new_ov
+                    # Advance cs cleanly if shrinking chunk_size would stall behind prev_end
+                    if c_idx > 0 and prev_end > 0:
+                        cs = max(cs, prev_end - cur_overlap)
                     if oom_cleanup_fn is not None:
                         oom_cleanup_fn()
                     gc.collect()
                     continue
                 raise
 
-        start_write = 0 if c_idx == 0 else min(overlap // 2, chunk_len - 1)
+        start_write = 0 if c_idx == 0 else min(max(1 if actual_ov >= 2 else 0, actual_ov // 2), chunk_len - 1)
         if store_in_memory:
             for local_i in range(start_write, chunk_len):
                 left_all[cs + local_i] = c_left[local_i]
@@ -999,15 +1081,15 @@ def run_chunked_tracking_loop(
             }
         )
 
-        # Retain ONLY the tail needed for next chunk's overlap
-        keep_tail = min(chunk_len, max(1, overlap))
+        prev_end = ce
+        keep_tail = min(chunk_len, max(1, cur_overlap))
         prev_tail_start = ce - keep_tail
         prev_tail_l = c_left[chunk_len - keep_tail :]
         prev_tail_r = c_right[chunk_len - keep_tail :]
 
         if ce >= n_frames:
             break
-        next_cs = ce - overlap
+        next_cs = ce - cur_overlap
         if next_cs <= cs:
             next_cs = cs + 1
         cs = next_cs
@@ -1026,9 +1108,7 @@ def run_chunked_tracking_loop(
 def _iter_stitched_pass_masks(
     ckpt_dir: Path, chunk_logs: list[dict[str, Any]], *, reverse_order: bool = False
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-    """
-    Stream `(left_bool, right_bool)` from chunk `.npz` checkpoints holding only one chunk at a time.
-    """
+    """Stream `(left_bool, right_bool)` from chunk `.npz` checkpoints loading each chunk once."""
     if not reverse_order:
         for ci, rec in enumerate(chunk_logs):
             cs = int(rec["start"])
@@ -1047,8 +1127,6 @@ def _iter_stitched_pass_masks(
                 for li in range(start_w, end_w):
                     yield l_arr[li].astype(bool), r_arr[li].astype(bool)
     else:
-        # Backward sub-pass stored frames in order [seed_idx, seed_idx-1, ..., 0];
-        # iterate chunks in reverse to emit global frames [0, 1, ..., seed_idx-1] in forward order!
         for ci in range(len(chunk_logs) - 1, -1, -1):
             rec = chunk_logs[ci]
             cs = int(rec["start"])
@@ -1065,7 +1143,6 @@ def _iter_stitched_pass_masks(
                 l_arr = data["left"]
                 r_arr = data["right"]
                 for li in range(end_w - 1, start_w - 1, -1):
-                    # Skip local 0 of chunk 0 (= seed_idx, already covered by forward pass)
                     if cs + li == 0:
                         continue
                     yield l_arr[li].astype(bool), r_arr[li].astype(bool)
@@ -1088,16 +1165,10 @@ def track_bidirectional_from_seed(
     store_in_memory: bool = True,
     oom_cleanup_fn: Callable[[], None] | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Seed SAM2.1 directly on `seed_idx` (the actual first frame where face/eyes were detected),
-    propagating forward `[seed_idx .. n-1]` and (when `seed_idx > 0`) backward `[seed_idx .. 0]`.
-
-    Returns `(left_all, right_all, fwd_logs, bwd_logs)`.
-    """
+    """Seed SAM2.1 directly on `seed_idx` and propagate forward and (if seed_idx > 0) backward."""
     if not (0 <= seed_idx < n_frames):
         raise ValueError(f"seed_idx {seed_idx} out of range [0, {n_frames})")
 
-    # Forward pass: [seed_idx .. n-1]
     fwd_n = n_frames - seed_idx
     fwd_l, fwd_r, fwd_logs = run_chunked_tracking_loop(
         chunk_runner,
@@ -1119,7 +1190,6 @@ def track_bidirectional_from_seed(
     if seed_idx == 0:
         return fwd_l, fwd_r, fwd_logs, []
 
-    # Backward pass: [seed_idx, seed_idx-1, ..., 0] (length seed_idx + 1, local 0 == seed_idx)
     bwd_n = seed_idx + 1
     bwd_l, bwd_r, bwd_logs = run_chunked_tracking_loop(
         chunk_runner,
@@ -1141,7 +1211,6 @@ def track_bidirectional_from_seed(
     if not store_in_memory:
         return [], [], fwd_logs, bwd_logs
 
-    # Reassemble [0 .. seed_idx-1] from reversed backward pass + [seed_idx .. n-1] from forward pass
     left_all = list(reversed(bwd_l[1:])) + fwd_l
     right_all = list(reversed(bwd_r[1:])) + fwd_r
     return left_all, right_all, fwd_logs, bwd_logs
@@ -1211,7 +1280,7 @@ def render_mask_overlay_grid(
     try:
         sheet.save(tmp_out, format="PNG")
         os.replace(tmp_out, out_path)
-    except Exception:
+    except BaseException:
         tmp_out.unlink(missing_ok=True)
         raise
 
@@ -1223,16 +1292,18 @@ def compute_segment_generation(
     init_right: dict[str, Any],
     config: SegmentConfig,
 ) -> tuple[str, str]:
-    """Return `(sam2_generation, segment_generation)` bound to upstream ROI bytes + config."""
+    """Return `(sam2_generation, segment_generation)` bound to live ROI bytes & all behavior configs."""
     sam2_payload = json.dumps(
         {
             "roi_frames_digest": roi_frames_digest,
             "model_id": config.model_id,
+            "device": config.device,
             "seed_idx": seed_idx,
             "init_left": init_left,
             "init_right": init_right,
             "chunk_size": config.chunk_size,
             "chunk_overlap": config.chunk_overlap,
+            "handoff_iou_threshold": config.handoff_iou_threshold,
         },
         sort_keys=True,
     )
@@ -1264,9 +1335,9 @@ def run_segment_stage(
 ) -> dict[str, Any]:
     """
     Execute Stage 2 end-to-end with:
-    - Safe basename validation & symlink confinement.
-    - Non-zero seed-frame bidirectional SAM2.1 tracking & CPU processor/state placement.
-    - O(1)-RAM disk-streamed temporal post-processing & atomic staged directory publishing.
+    - Live ROI content hashing & upstream generation verification.
+    - Non-zero seed-frame bidirectional SAM2.1 tracking, CPU processor/state placement, OOM backoff.
+    - O(1)-RAM disk-streamed consistency-gated postprocessing & single-generation atomic publish.
     """
     import torch
     from transformers import Sam2VideoModel, Sam2VideoProcessor
@@ -1274,8 +1345,8 @@ def run_segment_stage(
     roi_dir = Path(roi_dir)
     masks_root = Path(masks_root)
     reject_symlink_path(roi_dir, "roi_dir")
+    reject_symlink_path(masks_root.parent, "workspace root")
     reject_symlink_path(masks_root, "masks_root")
-    masks_root.mkdir(parents=True, exist_ok=True)
 
     frame_records = roi_meta["frames"]
     n = len(frame_records)
@@ -1283,13 +1354,18 @@ def run_segment_stage(
         raise ValueError("roi_meta contains 0 frames.")
 
     filenames = [validate_safe_basename(str(rec["filename"])) for rec in frame_records]
-    roi_frames_digest = str(roi_meta.get("roi_frames_digest") or "") or hash_files_manifest(
-        roi_dir, filenames
-    )
+    # ALWAYS hash live ROI frames rather than blindly trusting roi_meta's recorded digest
+    live_roi_digest = hash_files_manifest(roi_dir, filenames)
+    recorded_roi_digest = roi_meta.get("roi_frames_digest")
+    if recorded_roi_digest and recorded_roi_digest != live_roi_digest:
+        raise ValueError(
+            "ROI frames on disk do not match prep roi_boxes.json digest; rerun prep first."
+        )
 
     roi_size = int(roi_meta.get("roi_size", 512))
     fps = float(roi_meta.get("fps", 30.0))
     seed_idx = max(0, min(n - 1, int(roi_meta.get("init_frame_idx", 0))))
+    prep_gen = roi_meta.get("prep_generation")
 
     init_left, init_right = build_initial_lens_prompts(
         roi_meta.get("init_eye_geometry_roi"),
@@ -1297,14 +1373,17 @@ def run_segment_stage(
         override_prompts=config.lens_points,
     )
     sam2_gen, seg_gen = compute_segment_generation(
-        roi_frames_digest, seed_idx, init_left, init_right, config
+        live_roi_digest, seed_idx, init_left, init_right, config
     )
 
     configure_sdpa_guard(torch)
     device = resolve_torch_device(torch, config.device)
     dtype = preferred_inference_dtype(torch, device)
 
-    ckpt_dir = ensure_confined_dir(masks_root, masks_root / "_sam2_chunks", create=True)
+    # Keep resumable SAM2 chunk checkpoints in a sibling dir so masks_root commits atomically as one unit
+    ckpt_dir = ensure_confined_dir(
+        masks_root.parent, masks_root.parent / f".{masks_root.name}_sam2_chunks", create=True
+    )
 
     with gpu_file_lock(config.gpu_lock):
         if device.type == "cuda":
@@ -1364,73 +1443,65 @@ def run_segment_stage(
             gc.collect()
             cuda_empty_cache_if_needed(torch, device)
 
-    # Bounded O(1)-RAM disk-streamed temporal smoothing & glare hotspot export
     def _stream_raw_pairs() -> Iterator[tuple[np.ndarray, np.ndarray]]:
         if bwd_logs:
             yield from _iter_stitched_pass_masks(ckpt_dir, bwd_logs, reverse_order=True)
         yield from _iter_stitched_pass_masks(ckpt_dir, fwd_logs, reverse_order=False)
 
-    # Stream each of the 4 cleaned mask channels through a bounded sliding window (<= 2*r+1 in RAM)
-    # Using a single pass over raw pairs by keeping a tiny shared sliding buffer of cleaned masks!
-    stage_lens_dir = make_unique_temp_dir(masks_root, prefix=".stage_lens_interior_")
-    stage_exact_dir = make_unique_temp_dir(masks_root, prefix=".stage_lens_exact_")
-    stage_glare_dir = make_unique_temp_dir(masks_root, prefix=".stage_glare_hotspot_")
+    # Stage ALL published mask dirs + mask_stats.json into ONE generation dir for single atomic swap
+    masks_root.parent.mkdir(parents=True, exist_ok=True)
+    stage_masks = make_unique_temp_dir(masks_root.parent, prefix=f".stage_{masks_root.name}_")
+    stage_lens_dir = stage_masks / "roi_lens_interior"
+    stage_exact_dir = stage_masks / "roi_lens_exact"
+    stage_glare_dir = stage_masks / "roi_glare_hotspot"
+    for d in (stage_lens_dir, stage_exact_dir, stage_glare_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     radius = config.temporal_radius
     stats_list: list[dict[str, Any]] = []
 
     try:
         raw_iter = _stream_raw_pairs()
-        win_buf: dict[int, dict[str, tuple[np.ndarray | None, bool, tuple[int, int]]]] = {}
+        win_bufs: dict[str, dict[int, tuple[np.ndarray | None, np.ndarray, bool]]] = {
+            "lc": {},
+            "rc": {},
+            "le": {},
+            "re": {},
+        }
         loaded_up_to = 0
 
         def _ensure_win(target_excl: int) -> None:
             nonlocal loaded_up_to
             while loaded_up_to < target_excl and loaded_up_to < n:
                 l_raw, r_raw = next(raw_iter)
-                lc = clean_single_lens_mask(l_raw, config.erode_px)
-                rc = clean_single_lens_mask(r_raw, config.erode_px)
-                le = clean_single_lens_mask(l_raw, config.exact_erode_px)
-                re_ = clean_single_lens_mask(r_raw, config.exact_erode_px)
-                shape = (lc.shape[0], lc.shape[1])
-                win_buf[loaded_up_to] = {
-                    "lc": (*_capped_sdf(lc), shape),
-                    "rc": (*_capped_sdf(rc), shape),
-                    "le": (*_capped_sdf(le), shape),
-                    "re": (*_capped_sdf(re_), shape),
-                }
+                win_bufs["lc"][loaded_up_to] = _capped_sdf_entry(
+                    clean_single_lens_mask(l_raw, config.erode_px)
+                )
+                win_bufs["rc"][loaded_up_to] = _capped_sdf_entry(
+                    clean_single_lens_mask(r_raw, config.erode_px)
+                )
+                win_bufs["le"][loaded_up_to] = _capped_sdf_entry(
+                    clean_single_lens_mask(l_raw, config.exact_erode_px)
+                )
+                win_bufs["re"][loaded_up_to] = _capped_sdf_entry(
+                    clean_single_lens_mask(r_raw, config.exact_erode_px)
+                )
                 loaded_up_to += 1
-
-        def _resolve_smooth(i: int, key: str, lo: int, hi: int) -> np.ndarray:
-            shape = win_buf[i][key][2]
-            if radius <= 0 or n < 3:
-                sdf_i, empty_i, _ = win_buf[i][key]
-                if empty_i or sdf_i is None:
-                    return np.zeros(shape, dtype=np.uint8)
-                return (sdf_i > 0.0).astype(np.uint8) * 255
-            valid_sdfs = [
-                win_buf[j][key][0]
-                for j in range(lo, hi)
-                if not win_buf[j][key][1] and win_buf[j][key][0] is not None
-            ]
-            if len(valid_sdfs) * 2 < (hi - lo) or not valid_sdfs:
-                return np.zeros(shape, dtype=np.uint8)
-            avg_sdf = sum(valid_sdfs) / float(len(valid_sdfs))
-            return (avg_sdf > 0.0).astype(np.uint8) * 255
 
         for i in range(n):
             lo = max(0, i - radius)
             hi = min(n, i + radius + 1)
             _ensure_win(hi)
 
-            lc_i = _resolve_smooth(i, "lc", lo, hi)
-            rc_i = _resolve_smooth(i, "rc", lo, hi)
-            le_i = _resolve_smooth(i, "le", lo, hi)
-            re_i = _resolve_smooth(i, "re", lo, hi)
+            lc_i = _resolve_consistent_window_mask(win_bufs["lc"], i, lo, hi, radius=radius)
+            rc_i = _resolve_consistent_window_mask(win_bufs["rc"], i, lo, hi, radius=radius)
+            le_i = _resolve_consistent_window_mask(win_bufs["le"], i, lo, hi, radius=radius)
+            re_i = _resolve_consistent_window_mask(win_bufs["re"], i, lo, hi, radius=radius)
 
-            for k in list(win_buf.keys()):
-                if k < i - radius:
-                    del win_buf[k]
+            for ch_buf in win_bufs.values():
+                for k in list(ch_buf.keys()):
+                    if k < i - radius:
+                        del ch_buf[k]
 
             fn = filenames[i]
             roi_fp = ensure_safe_child_file(roi_dir, fn)
@@ -1474,72 +1545,68 @@ def run_segment_stage(
                 }
             )
 
-        roi_lens_dir = ensure_confined_dir(masks_root, masks_root / "roi_lens_interior", create=False)
-        roi_exact_dir = ensure_confined_dir(masks_root, masks_root / "roi_lens_exact", create=False)
-        roi_glare_dir = ensure_confined_dir(masks_root, masks_root / "roi_glare_hotspot", create=False)
+        lens_digest = hash_files_manifest(stage_lens_dir, filenames)
+        exact_digest = hash_files_manifest(stage_exact_dir, filenames)
+        glare_digest = hash_files_manifest(stage_glare_dir, filenames)
+        masks_digest = hashlib.sha256(
+            f"{lens_digest}:{exact_digest}:{glare_digest}".encode()
+        ).hexdigest()
 
-        atomic_swap_directory(stage_lens_dir, roi_lens_dir)
-        atomic_swap_directory(stage_exact_dir, roi_exact_dir)
-        atomic_swap_directory(stage_glare_dir, roi_glare_dir)
-    except Exception:
-        for sd in (stage_lens_dir, stage_exact_dir, stage_glare_dir):
-            if sd.exists():
-                shutil.rmtree(sd, ignore_errors=True)
+        l_areas = [s["left_lens_roi_px"] for s in stats_list]
+        r_areas = [s["right_lens_roi_px"] for s in stats_list]
+        l_med = float(np.median(l_areas)) if l_areas else 0.0
+        r_med = float(np.median(r_areas)) if r_areas else 0.0
+        anomalies = [
+            s["frame_idx"]
+            for s in stats_list
+            if (l_med > 0 and not (0.65 * l_med <= s["left_lens_roi_px"] <= 1.40 * l_med))
+            or (r_med > 0 and not (0.65 * r_med <= s["right_lens_roi_px"] <= 1.40 * r_med))
+        ]
+        g_pcts = [s["glare_pct_of_lenses"] for s in stats_list]
+        summary = {
+            "model_id": config.model_id,
+            "prep_generation": prep_gen,
+            "sam2_generation": sam2_gen,
+            "segment_generation": seg_gen,
+            "roi_frames_digest": live_roi_digest,
+            "masks_digest": masks_digest,
+            "seed_frame_idx": seed_idx,
+            "chunk_size": config.chunk_size,
+            "chunk_overlap": config.chunk_overlap,
+            "handoff_iou_threshold": config.handoff_iou_threshold,
+            "erode_px_roi": config.erode_px,
+            "exact_erode_px_roi": config.exact_erode_px,
+            "glare_dilate_px_roi": config.glare_dilate_px,
+            "glare_sensitivity": config.glare_sensitivity,
+            "num_frames": n,
+            "init_prompts": {"left": init_left, "right": init_right},
+            "left_lens_px_min_med_max": [min(l_areas), int(l_med), max(l_areas)],
+            "right_lens_px_min_med_max": [min(r_areas), int(r_med), max(r_areas)],
+            "area_anomaly_frames": anomalies,
+            "glare_pct_min_med_max": [min(g_pcts), round(float(np.median(g_pcts)), 2), max(g_pcts)],
+            "peak_vram_gib": round(peak_gb, 2),
+            "chunks": fwd_logs + bwd_logs,
+            "frames": stats_list,
+        }
+        atomic_write_text(stage_masks / "mask_stats.json", json.dumps(summary, indent=2))
+
+        if config.write_qa_grid:
+            sample_idxs = np.linspace(0, n - 1, min(config.qa_grid_samples, n), dtype=int).tolist()
+            render_mask_overlay_grid(
+                roi_dir,
+                frame_records,
+                stage_exact_dir,
+                stage_glare_dir,
+                sample_idxs=sample_idxs,
+                fps=fps,
+                out_path=stage_masks / "mask_qa_grid.png",
+            )
+
+        # Single atomic generation commit: mask dirs + manifest appear together or not at all!
+        atomic_swap_directory(stage_masks, masks_root)
+    except BaseException:
+        if stage_masks.exists():
+            shutil.rmtree(stage_masks, ignore_errors=True)
         raise
-
-    lens_digest = hash_files_manifest(roi_lens_dir, filenames)
-    exact_digest = hash_files_manifest(roi_exact_dir, filenames)
-    glare_digest = hash_files_manifest(roi_glare_dir, filenames)
-    masks_digest = hashlib.sha256(
-        f"{lens_digest}:{exact_digest}:{glare_digest}".encode()
-    ).hexdigest()
-
-    l_areas = [s["left_lens_roi_px"] for s in stats_list]
-    r_areas = [s["right_lens_roi_px"] for s in stats_list]
-    l_med = float(np.median(l_areas)) if l_areas else 0.0
-    r_med = float(np.median(r_areas)) if r_areas else 0.0
-    anomalies = [
-        s["frame_idx"]
-        for s in stats_list
-        if (l_med > 0 and not (0.65 * l_med <= s["left_lens_roi_px"] <= 1.40 * l_med))
-        or (r_med > 0 and not (0.65 * r_med <= s["right_lens_roi_px"] <= 1.40 * r_med))
-    ]
-    g_pcts = [s["glare_pct_of_lenses"] for s in stats_list]
-    summary = {
-        "model_id": config.model_id,
-        "sam2_generation": sam2_gen,
-        "segment_generation": seg_gen,
-        "roi_frames_digest": roi_frames_digest,
-        "masks_digest": masks_digest,
-        "seed_frame_idx": seed_idx,
-        "chunk_size": config.chunk_size,
-        "chunk_overlap": config.chunk_overlap,
-        "erode_px_roi": config.erode_px,
-        "exact_erode_px_roi": config.exact_erode_px,
-        "glare_dilate_px_roi": config.glare_dilate_px,
-        "glare_sensitivity": config.glare_sensitivity,
-        "num_frames": n,
-        "init_prompts": {"left": init_left, "right": init_right},
-        "left_lens_px_min_med_max": [min(l_areas), int(l_med), max(l_areas)],
-        "right_lens_px_min_med_max": [min(r_areas), int(r_med), max(r_areas)],
-        "area_anomaly_frames": anomalies,
-        "glare_pct_min_med_max": [min(g_pcts), round(float(np.median(g_pcts)), 2), max(g_pcts)],
-        "peak_vram_gib": round(peak_gb, 2),
-        "chunks": fwd_logs + bwd_logs,
-        "frames": stats_list,
-    }
-    atomic_write_text(masks_root / "mask_stats.json", json.dumps(summary, indent=2))
-
-    if config.write_qa_grid:
-        sample_idxs = np.linspace(0, n - 1, min(config.qa_grid_samples, n), dtype=int).tolist()
-        render_mask_overlay_grid(
-            roi_dir,
-            frame_records,
-            roi_exact_dir,
-            roi_glare_dir,
-            sample_idxs=sample_idxs,
-            fps=fps,
-            out_path=masks_root / "mask_qa_grid.png",
-        )
 
     return summary

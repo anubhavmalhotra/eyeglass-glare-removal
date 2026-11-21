@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from eyeglass_glare_removal._workspace import (
+    assert_source_outside_managed_dir,
     atomic_swap_directory,
     ensure_confined_dir,
     make_unique_temp_dir,
@@ -24,7 +25,7 @@ from eyeglass_glare_removal._workspace import (
 
 logger = logging.getLogger(__name__)
 
-_SAFE_COLOR_VALUES = frozenset(
+_SAFE_COLOR_PRIMARIES = frozenset(
     {
         "bt709",
         "bt470m",
@@ -33,24 +34,42 @@ _SAFE_COLOR_VALUES = frozenset(
         "smpte240m",
         "film",
         "bt2020",
-        "bt2020nc",
-        "bt2020c",
+        "smpte431",
+        "smpte432",
+    }
+)
+_SAFE_COLOR_TRC = frozenset(
+    {
+        "bt709",
+        "gamma22",
+        "gamma28",
+        "smpte170m",
+        "smpte240m",
+        "linear",
+        "iec61966-2-1",
         "bt2020-10",
         "bt2020-12",
         "smpte2084",
         "arib-std-b67",
-        "iec61966-2-1",
-        "fcc",
-        "linear",
-        "rgb",
     }
 )
+_YUV_MATRIX_MAP = {
+    "bt709": "bt709",
+    "smpte170m": "smpte170m",
+    "bt470bg": "bt470bg",
+    "smpte240m": "smpte240m",
+    "fcc": "fcc",
+    "bt2020nc": "bt2020nc",
+    "bt2020c": "bt2020nc",
+    "bt2020": "bt2020nc",
+}
+_SAFE_COLOR_RANGES = frozenset({"tv", "pc"})
 _SAR_PATTERN = re.compile(r"^([1-9]\d*):([1-9]\d*)$")
 
 
 @dataclass
 class VideoMetadata:
-    """Probed media stream properties with display-matrix rotation and stream indices."""
+    """Probed media stream properties with display-oriented SAR, rotation, and A/V timestamps."""
 
     path: str
     width: int
@@ -65,6 +84,8 @@ class VideoMetadata:
     video_stream_index: int = 0
     audio_stream_index: int | None = None
     sample_aspect_ratio: str | None = None
+    video_start_time: float = 0.0
+    audio_start_time: float | None = None
     audio_codec: str | None = None
     video_codec: str | None = None
     pix_fmt: str | None = None
@@ -89,16 +110,20 @@ def require_binary(name: str) -> str:
 
 
 def ffmpeg_local_path(path: Path | str, *, must_exist: bool = False) -> str:
-    """
-    Normalize a local filesystem path into an unambiguous FFmpeg `file:` URI.
-
-    Resolving to an absolute path and prefixing `file:` (paired with `-protocol_whitelist`)
-    ensures FFmpeg/FFprobe cannot misparse leading `-` as options, literal `file:` basenames
-    as protocol redirects, or embedded colons as network protocols.
-    """
+    """Normalize a local filesystem path into an unambiguous FFmpeg `file:` URI."""
     p = Path(path)
     resolved = p.resolve(strict=must_exist)
     return f"file:{resolved}"
+
+
+def ffmpeg_image2_pattern(directory: Path, pattern: str = "%06d.png") -> str:
+    """
+    Build a safe FFmpeg `image2` output URL escaping any literal `%` in `directory` as `%%`
+    so parent directories containing `%` do not break frame-sequence formatting.
+    """
+    resolved_dir = str(directory.resolve())
+    escaped_dir = resolved_dir.replace("%", "%%")
+    return f"file:{escaped_dir}{os.sep}{pattern}"
 
 
 def run_subprocess(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -143,8 +168,7 @@ def normalize_rotation(raw_rotation: Any) -> int:
         return 0
     if not math.isfinite(deg):
         return 0
-    snapped = int(round(deg / 90.0) * 90) % 360
-    return snapped
+    return int(round(deg / 90.0) * 90) % 360
 
 
 def extract_stream_rotation(video_stream: dict[str, Any]) -> int:
@@ -160,30 +184,38 @@ def extract_stream_rotation(video_stream: dict[str, Any]) -> int:
     return 0
 
 
-def _sanitize_sar(raw_sar: Any) -> str | None:
+def _sanitize_sar(raw_sar: Any, *, invert: bool = False) -> str | None:
+    """Parse a positive rational SAR `num:den`, optionally inverting for 90/270 autorotation."""
     if not isinstance(raw_sar, str):
         return None
-    s = raw_sar.strip()
-    if not _SAR_PATTERN.match(s):
+    m = _SAR_PATTERN.match(raw_sar.strip())
+    if not m:
         return None
-    return s
+    num, den = int(m.group(1)), int(m.group(2))
+    frac = Fraction(den, num) if invert else Fraction(num, den)
+    return f"{frac.numerator}:{frac.denominator}"
 
 
-def _sanitize_color_tag(raw: Any) -> str | None:
+def _sanitize_tag(raw: Any, allowed: frozenset[str]) -> str | None:
     if not isinstance(raw, str):
         return None
     v = raw.strip().lower()
-    if v in _SAFE_COLOR_VALUES:
-        return v
-    return None
+    return v if v in allowed else None
+
+
+def _parse_start_time(stream: dict[str, Any]) -> float:
+    raw = stream.get("start_time")
+    if raw in (None, "N/A", ""):
+        return 0.0
+    try:
+        val = float(raw)
+        return val if math.isfinite(val) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _select_primary_video_stream(streams: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """
-    Select the primary real video stream explicitly, excluding attached cover-art pictures.
-
-    Preference order: default disposition -> largest pixel area -> lowest stream index.
-    """
+    """Select the primary real video stream explicitly, excluding attached cover-art pictures."""
     candidates = []
     for pos, s in enumerate(streams):
         if s.get("codec_type") != "video":
@@ -241,10 +273,14 @@ def parse_ffprobe_payload(path: Path | str, payload: dict[str, Any]) -> VideoMet
     )
 
     rotation = extract_stream_rotation(video_stream)
-    if rotation in (90, 270):
+    quarter_turn = rotation in (90, 270)
+    if quarter_turn:
         display_w, display_h = height, width
     else:
         display_w, display_h = width, height
+
+    # Quarter-turn autorotation transposes pixel aspect ratio: coded num:den -> display den:num
+    display_sar = _sanitize_sar(video_stream.get("sample_aspect_ratio"), invert=quarter_turn)
 
     avg_fps = parse_rate(video_stream.get("avg_frame_rate"))
     r_fps = parse_rate(video_stream.get("r_frame_rate"))
@@ -277,6 +313,9 @@ def parse_ffprobe_payload(path: Path | str, payload: dict[str, Any]) -> VideoMet
         except (TypeError, ValueError):
             duration_sec = None
 
+    raw_cs = (video_stream.get("color_space") or "").strip().lower()
+    norm_cs = _YUV_MATRIX_MAP.get(raw_cs)
+
     return VideoMetadata(
         path=str(path),
         width=width,
@@ -290,14 +329,16 @@ def parse_ffprobe_payload(path: Path | str, payload: dict[str, Any]) -> VideoMet
         has_audio=audio_stream is not None,
         video_stream_index=video_stream_index,
         audio_stream_index=audio_stream_index,
-        sample_aspect_ratio=_sanitize_sar(video_stream.get("sample_aspect_ratio")),
+        sample_aspect_ratio=display_sar,
+        video_start_time=_parse_start_time(video_stream),
+        audio_start_time=_parse_start_time(audio_stream) if audio_stream is not None else None,
         audio_codec=audio_stream.get("codec_name") if audio_stream else None,
         video_codec=video_stream.get("codec_name"),
         pix_fmt=video_stream.get("pix_fmt"),
-        color_primaries=_sanitize_color_tag(video_stream.get("color_primaries")),
-        color_trc=_sanitize_color_tag(video_stream.get("color_transfer")),
-        colorspace=_sanitize_color_tag(video_stream.get("color_space")),
-        color_range=video_stream.get("color_range"),
+        color_primaries=_sanitize_tag(video_stream.get("color_primaries"), _SAFE_COLOR_PRIMARIES),
+        color_trc=_sanitize_tag(video_stream.get("color_transfer"), _SAFE_COLOR_TRC),
+        colorspace=norm_cs,
+        color_range=_sanitize_tag(video_stream.get("color_range"), _SAFE_COLOR_RANGES),
     )
 
 
@@ -330,8 +371,8 @@ def probe_video(path: Path | str) -> VideoMetadata:
 
 def probe_audio_has_packets(audio_path: Path) -> bool:
     """
-    Verify an extracted audio file contains a valid audio stream with >= 1 decoded packet
-    or positive stream duration (preventing empty/packetless `.m4a` files after trims).
+    Strictly verify an extracted audio file contains a valid audio stream with an actual
+    positive packet count (`nb_read_packets > 0` or `nb_packets > 0`).
     """
     if not audio_path.exists() or audio_path.stat().st_size == 0:
         return False
@@ -369,18 +410,30 @@ def probe_audio_has_packets(audio_path: Path) -> bool:
         raw = st.get(key)
         if raw not in (None, "N/A", ""):
             try:
-                if int(raw) > 0:
-                    return True
-                return False
+                return int(raw) > 0
             except ValueError:
-                pass
-    raw_dur = st.get("duration")
-    if raw_dur not in (None, "N/A", ""):
-        try:
-            return float(raw_dur) > 0.0
-        except ValueError:
-            return False
+                return False
     return False
+
+
+def compute_audio_offset_sec(meta: VideoMetadata, start_sec: float = 0.0) -> float:
+    """
+    Compute the audio-relative-to-video start offset on the output CFR timeline.
+
+    When rawvideo starts at 0.0 (corresponding to `video_origin = max(video_start_time, start_sec)`),
+    preserving `audio_origin - video_origin` via `-itsoffset` retains intentional A/V lead/delay.
+    """
+    if not meta.has_audio or meta.audio_start_time is None:
+        return 0.0
+    v_start = float(meta.video_start_time or 0.0)
+    a_start = float(meta.audio_start_time)
+    if start_sec <= 0.0:
+        offset = a_start - v_start
+    else:
+        v_origin = max(v_start, float(start_sec))
+        a_origin = max(a_start, float(start_sec))
+        offset = a_origin - v_origin
+    return round(offset, 6) if math.isfinite(offset) else 0.0
 
 
 def format_fps_arg(fps: float) -> str:
@@ -402,21 +455,24 @@ def extract_cfr_frames(
     """
     Extract display-oriented CFR PNG frames and optional audio track from source_video.
 
-    - Uses unambiguous `file:` normalized local paths + `-protocol_whitelist file`.
+    - Rejects any source aliasing or residing inside `out_dir` BEFORE any write or unlink.
+    - Escapes literal `%` in `out_dir` paths for FFmpeg's `image2` muxer.
     - Maps the exact probed primary video/audio stream index (`-map 0:<idx>`).
-    - Preserves 1-frame and short clips across FFmpeg 6/7+ (`eof_action=pass` + 1-frame fallback).
-    - Verifies extracted audio actually contains valid packets; handles silent videos cleanly.
-    - Publishes frames atomically via a unique staging directory (rejecting symlinked workdirs).
+    - Preserves 1-frame clips (`eof_action=pass` + 1-frame fallback) and verifies actual audio packets.
     """
-    ffmpeg = require_binary("ffmpeg")
     source_path = Path(source_video)
+    out_dir = Path(out_dir)
+
+    # Guard BEFORE checking binaries, creating directories, unlinking, or swapping!
+    reject_symlink_path(out_dir, "prep output directory")
+    assert_source_outside_managed_dir(source_path, out_dir)
+
+    ffmpeg = require_binary("ffmpeg")
     meta = metadata or probe_video(source_path)
 
     fps = float(target_fps) if target_fps is not None else float(meta.fps)
     fps_str = format_fps_arg(fps)
 
-    out_dir = Path(out_dir)
-    reject_symlink_path(out_dir, "prep output directory")
     out_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = ensure_confined_dir(out_dir, out_dir / "frames", create=False)
 
@@ -426,7 +482,7 @@ def extract_cfr_frames(
 
     src_arg = ffmpeg_local_path(source_path, must_exist=source_path.exists())
 
-    # 1. Extract and verify audio only if source has an audio stream
+    # 1. Extract and strictly verify audio packets only if source has an audio stream
     audio_path: Path | None = None
     final_audio = out_dir / "audio.m4a"
     reject_symlink_path(final_audio, "audio output file")
@@ -459,17 +515,17 @@ def extract_cfr_frames(
                 tmp_audio.unlink(missing_ok=True)
                 if final_audio.exists():
                     final_audio.unlink()
-        except Exception:
+        except BaseException:
             tmp_audio.unlink(missing_ok=True)
             raise
     else:
         if final_audio.exists():
             final_audio.unlink()
 
-    # 2. Extract auto-rotated CFR PNG frames into a unique staging directory, then swap atomically
+    # 2. Extract auto-rotated CFR PNG frames into a unique staging dir, escaping `%` in dir path
     stage_frames_dir = make_unique_temp_dir(out_dir, prefix=".stage_frames_")
     try:
-        out_pattern = ffmpeg_local_path(stage_frames_dir / "%06d.png")
+        out_pattern = ffmpeg_image2_pattern(stage_frames_dir, "%06d.png")
         fps_filter = f"fps=fps={fps_str}:round=near:eof_action=pass"
 
         frame_cmd = [ffmpeg, "-y", "-v", "error", "-protocol_whitelist", "file"]
@@ -495,7 +551,6 @@ def extract_cfr_frames(
 
         staged_pngs = sorted(stage_frames_dir.glob("*.png"))
         if not staged_pngs:
-            # Defensive 1-frame fallback when fps filter drops a single-frame clip at trim/EOF
             fallback_cmd = [ffmpeg, "-y", "-v", "error", "-protocol_whitelist", "file"]
             if start_sec > 0.0:
                 fallback_cmd += ["-ss", f"{start_sec:.6f}"]
@@ -521,7 +576,7 @@ def extract_cfr_frames(
             )
 
         atomic_swap_directory(stage_frames_dir, frames_dir)
-    except Exception:
+    except BaseException:
         if stage_frames_dir.exists():
             shutil.rmtree(stage_frames_dir, ignore_errors=True)
         raise
@@ -537,6 +592,7 @@ def build_video_writer_cmd(
     out_mp4: Path,
     *,
     audio_path: Path | None = None,
+    audio_offset_sec: float = 0.0,
     crf: int = 16,
     preset: str = "medium",
     lossless: bool = False,
@@ -545,16 +601,17 @@ def build_video_writer_cmd(
     color_primaries: str | None = None,
     color_trc: str | None = None,
     colorspace: str | None = None,
+    color_range: str | None = None,
     ffmpeg_bin: str = "ffmpeg",
 ) -> list[str]:
     """
     Build the ffmpeg command list for streaming RGB24 frames to MP4.
 
-    - Uses `-protocol_whitelist file,pipe`, `-i pipe:0`, and `file:` local paths.
-    - Never uses `-shortest` (prevents short audio tracks from truncating valid video);
-      uses the CFR video clock (`-t num_frames/fps`) to cap trailing audio cleanly.
-    - Preserves non-1:1 SAR (`setsar`) and source color signaling when known.
-    - Supports `lossless=True` (`libx264rgb -crf 0 -pix_fmt rgb24`) for decoded pixel equality.
+    - Preserves display-oriented SAR as an exact rational (`setsar=sar=num/den:max=100000`).
+    - Explicitly converts RGB->YUV with matching matrix & range (`scale=out_color_matrix=...`)
+      and emits ONLY accurate color tags describing the encoded pixels (never fabricates unknown
+      primaries/transfer characteristics).
+    - Preserves A/V start offset via `-itsoffset` and caps trailing audio via CFR `-t` (never `-shortest`).
     """
     if width <= 0 or height <= 0:
         raise ValueError(f"Invalid output dimensions: {width}x{height}")
@@ -587,14 +644,25 @@ def build_video_writer_cmd(
     )
     if has_audio:
         assert audio_path is not None
+        if math.isfinite(audio_offset_sec) and abs(audio_offset_sec) > 1e-4:
+            cmd += ["-itsoffset", f"{audio_offset_sec:.6f}"]
         cmd += ["-i", ffmpeg_local_path(audio_path, must_exist=True)]
 
     vf_parts: list[str] = []
-    if (not lossless) and ((width % 2 != 0) or (height % 2 != 0)):
-        vf_parts.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
-    sar = _sanitize_sar(sample_aspect_ratio)
+    out_matrix = _YUV_MATRIX_MAP.get((colorspace or "").strip().lower(), "bt709")
+    out_range = _sanitize_tag(color_range, _SAFE_COLOR_RANGES) or "tv"
+
+    if not lossless:
+        if (width % 2 != 0) or (height % 2 != 0):
+            vf_parts.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+        # Explicitly convert RGB24 -> YUV420p using the exact signaled matrix & range
+        vf_parts.append(f"scale=out_color_matrix={out_matrix}:out_range={out_range}")
+
+    sar = _sanitize_sar(sample_aspect_ratio, invert=False)
     if sar is not None and sar != "1:1":
-        vf_parts.append(f"setsar={sar.replace(':', '/')}")
+        num_s, den_s = sar.split(":", 1)
+        vf_parts.append(f"setsar=sar={num_s}/{den_s}:max=100000")
+
     if vf_parts:
         cmd += ["-vf", ",".join(vf_parts)]
 
@@ -612,11 +680,12 @@ def build_video_writer_cmd(
             preset,
             "-pix_fmt",
             "rgb24",
+            "-color_range",
+            "pc",
+            "-colorspace",
+            "rgb",
         ]
     else:
-        cp = _sanitize_color_tag(color_primaries) or "bt709"
-        ct = _sanitize_color_tag(color_trc) or "bt709"
-        cs = _sanitize_color_tag(colorspace) or "bt709"
         cmd += [
             "-c:v",
             "libx264",
@@ -626,18 +695,22 @@ def build_video_writer_cmd(
             preset,
             "-pix_fmt",
             "yuv420p",
-            "-color_primaries",
-            cp,
-            "-color_trc",
-            ct,
+            "-color_range",
+            out_range,
             "-colorspace",
-            cs,
+            out_matrix,
         ]
+        # Only emit primaries & transfer tags when actually known from source metadata
+        cp = _sanitize_tag(color_primaries, _SAFE_COLOR_PRIMARIES)
+        ct = _sanitize_tag(color_trc, _SAFE_COLOR_TRC)
+        if cp is not None:
+            cmd += ["-color_primaries", cp]
+        if ct is not None:
+            cmd += ["-color_trc", ct]
 
     if has_audio:
         cmd += ["-c:a", "copy"]
         if num_frames is not None and num_frames > 0 and fps > 0:
-            # Cap output to authoritative CFR video duration (never truncate video via -shortest!)
             vid_dur = float(num_frames) / float(fps)
             cmd += ["-t", f"{vid_dur:.6f}"]
 
@@ -652,6 +725,7 @@ def open_video_writer_pipe(
     out_mp4: Path,
     *,
     audio_path: Path | None = None,
+    audio_offset_sec: float = 0.0,
     crf: int = 16,
     preset: str = "medium",
     lossless: bool = False,
@@ -660,6 +734,7 @@ def open_video_writer_pipe(
     color_primaries: str | None = None,
     color_trc: str | None = None,
     colorspace: str | None = None,
+    color_range: str | None = None,
 ) -> subprocess.Popen[bytes]:
     """Open an ffmpeg stdin pipe expecting contiguous RGB24 frame buffers."""
     ffmpeg = require_binary("ffmpeg")
@@ -670,6 +745,7 @@ def open_video_writer_pipe(
         fps=fps,
         out_mp4=out_mp4,
         audio_path=audio_path,
+        audio_offset_sec=audio_offset_sec,
         crf=crf,
         preset=preset,
         lossless=lossless,
@@ -678,6 +754,7 @@ def open_video_writer_pipe(
         color_primaries=color_primaries,
         color_trc=color_trc,
         colorspace=colorspace,
+        color_range=color_range,
         ffmpeg_bin=ffmpeg,
     )
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)

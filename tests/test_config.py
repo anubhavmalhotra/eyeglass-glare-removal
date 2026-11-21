@@ -61,9 +61,11 @@ def test_prep_config_validation() -> None:
 
 def test_segment_config_validation() -> None:
     with pytest.raises(ValueError, match="chunk_size"):
-        SegmentConfig(chunk_size=1)
+        SegmentConfig(chunk_size=2)
     with pytest.raises(ValueError, match="chunk_overlap"):
         SegmentConfig(chunk_size=50, chunk_overlap=0)
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        SegmentConfig(chunk_size=50, chunk_overlap=1)
     with pytest.raises(ValueError, match="chunk_overlap"):
         SegmentConfig(chunk_size=50, chunk_overlap=50)
     with pytest.raises(ValueError, match="glare_sensitivity"):
@@ -71,6 +73,7 @@ def test_segment_config_validation() -> None:
     with pytest.raises(ValueError, match="Invalid device"):
         SegmentConfig(device="tpu:0")
 
+    assert SegmentConfig(chunk_size=3, chunk_overlap=2).chunk_overlap == 2
     assert SegmentConfig(device="cuda:0").device == "cuda:0"
     assert SegmentConfig(device="mps").device == "mps"
     assert SegmentConfig(device="cpu").device == "cpu"

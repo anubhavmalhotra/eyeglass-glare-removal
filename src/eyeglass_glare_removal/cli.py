@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from eyeglass_glare_removal import __version__
-from eyeglass_glare_removal._workspace import ensure_safe_child_file, workdir_lock
+from eyeglass_glare_removal._workspace import (
+    assert_source_outside_managed_dir,
+    ensure_safe_child_file,
+    reject_symlink_components_under,
+    workdir_lock,
+)
 from eyeglass_glare_removal.composite import run_composite_stage
 from eyeglass_glare_removal.config import (
     DEFAULT_NEG_PROMPT,
@@ -31,6 +36,10 @@ from eyeglass_glare_removal.pipeline import (
     WorkDirLayout,
     resolve_confined_audio_path,
     run_pipeline,
+    verify_inpaint_artifacts,
+    verify_prep_artifacts,
+    verify_reference_artifact,
+    verify_segment_artifacts,
 )
 from eyeglass_glare_removal.reference import build_clean_reference
 from eyeglass_glare_removal.segment import run_segment_stage
@@ -119,7 +128,7 @@ def _add_segment_args(p: argparse.ArgumentParser) -> None:
         help="Hugging Face model ID for SAM2.1 video segmentation",
     )
     g.add_argument("--sam2-chunk-size", type=int, default=280, help="Frames per SAM2 tracking session")
-    g.add_argument("--sam2-overlap", type=int, default=10, help="Overlap frames between SAM2 chunks (>= 1)")
+    g.add_argument("--sam2-overlap", type=int, default=10, help="Overlap frames between SAM2 chunks (>= 2)")
     g.add_argument("--erode-px", type=int, default=5, help="Inward erosion for conservative roi_lens_interior")
     g.add_argument("--exact-erode-px", type=int, default=1, help="Tight erosion for zero-outline roi_lens_exact")
     g.add_argument("--glare-dilate-px", type=int, default=5, help="Glare hotspot dilation in ROI pixels")
@@ -275,6 +284,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp = sub.add_parser("composite", help="Stage 5: Rim-safe bounded-RAM streaming composite to MP4.")
     p_cmp.add_argument("--work-dir", type=Path, required=True, help="Workspace directory containing prep/, masks/, inpaint/")
     p_cmp.add_argument("-o", "--output", type=Path, required=True, help="Output cleaned MP4 path")
+    p_cmp.add_argument(
+        "--source",
+        type=Path,
+        default=None,
+        help="Explicit source video path for overwrite-protection verification (required for legacy relative manifests)",
+    )
     _add_composite_args(p_cmp)
     _add_common_runtime_args(p_cmp, include_gpu=False, include_resume=False)
 
@@ -406,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
         layout = WorkDirLayout(args.work_dir)
         with workdir_lock(layout.root):
             if args.command == "prep":
+                reject_symlink_components_under(layout.root, layout.prep_dir)
+                assert_source_outside_managed_dir(args.input, layout.root)
                 prep_cfg = PrepConfig(
                     start_sec=args.start,
                     duration_sec=_resolve_duration(args),
@@ -424,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "segment":
-                roi_meta = json.loads(layout.roi_boxes_json.read_text(encoding="utf-8"))
+                roi_meta, _, _, _ = verify_prep_artifacts(layout)
+                reject_symlink_components_under(layout.root, layout.masks_dir)
                 seg_cfg = SegmentConfig(
                     model_id=args.sam2_model,
                     chunk_size=args.sam2_chunk_size,
@@ -447,16 +465,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "reference":
-                roi_meta = (
-                    json.loads(layout.roi_boxes_json.read_text(encoding="utf-8"))
-                    if layout.roi_boxes_json.exists()
-                    else None
-                )
-                mask_stats = (
-                    json.loads(layout.mask_stats_json.read_text(encoding="utf-8"))
-                    if layout.mask_stats_json.exists()
-                    else None
-                )
+                reject_symlink_components_under(layout.root, layout.reference_dir)
+                roi_meta: dict[str, Any] | None = None
+                mask_stats: dict[str, Any] | None = None
+                is_auto_mode = not args.no_ref and args.ref_image is None
+                if is_auto_mode:
+                    roi_meta, filenames, _, live_roi_digest = verify_prep_artifacts(layout)
+                    mask_stats, _ = verify_segment_artifacts(
+                        layout, roi_meta, filenames, live_roi_digest
+                    )
+                elif layout.roi_boxes_json.exists() or layout.roi_boxes_json.is_symlink():
+                    roi_meta, _, _, _ = verify_prep_artifacts(layout)
+
                 roi_size = (
                     args.roi_size
                     if args.roi_size is not None
@@ -466,15 +486,11 @@ def main(argv: list[str] | None = None) -> int:
                 res = build_clean_reference(
                     config=ref_cfg,
                     out_dir=layout.reference_dir,
-                    roi_dir=layout.roi_frames_dir if layout.roi_frames_dir.exists() else None,
+                    roi_dir=layout.roi_frames_dir if is_auto_mode else None,
                     roi_meta=roi_meta,
                     mask_stats=mask_stats,
-                    lens_masks_dir=layout.roi_lens_interior_dir
-                    if layout.roi_lens_interior_dir.exists()
-                    else None,
-                    glare_masks_dir=layout.roi_glare_hotspot_dir
-                    if layout.roi_glare_hotspot_dir.exists()
-                    else None,
+                    lens_masks_dir=layout.roi_lens_interior_dir if is_auto_mode else None,
+                    glare_masks_dir=layout.roi_glare_hotspot_dir if is_auto_mode else None,
                 )
                 print(json.dumps(res.to_dict(), indent=2))
                 return 0
@@ -482,17 +498,25 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "inpaint":
                 if args.ref_image is not None and args.no_ref:
                     raise ValueError("Specify either --ref-image or --no-ref, not both.")
-                roi_meta = json.loads(layout.roi_boxes_json.read_text(encoding="utf-8"))
+                roi_meta, filenames, _, live_roi_digest = verify_prep_artifacts(layout)
+                mask_stats, live_masks_digest = verify_segment_artifacts(
+                    layout, roi_meta, filenames, live_roi_digest
+                )
+                reject_symlink_components_under(layout.root, layout.inpaint_dir)
                 frame_paths = [
-                    ensure_safe_child_file(layout.roi_frames_dir, str(r["filename"]))
-                    for r in roi_meta["frames"]
+                    ensure_safe_child_file(
+                        layout.roi_frames_dir, fn, workspace_root=layout.root
+                    )
+                    for fn in filenames
                 ]
                 ref_paths: list[Path] | None = None
                 if not args.no_ref:
                     if args.ref_image is not None:
                         ref_paths = [args.ref_image]
-                    elif layout.clean_eye_ref_png.exists():
-                        ref_paths = [layout.clean_eye_ref_png]
+                    else:
+                        verified_ref = verify_reference_artifact(layout, roi_meta, mask_stats)
+                        if verified_ref is not None:
+                            ref_paths = [verified_ref]
                 inp_size = (
                     args.size
                     if args.size is not None
@@ -526,18 +550,25 @@ def main(argv: list[str] | None = None) -> int:
                     clamp_mask_dir=layout.roi_lens_interior_dir,
                     ref_image_paths=ref_paths,
                     resume=args.resume,
+                    prep_generation=roi_meta.get("prep_generation"),
+                    segment_generation=mask_stats.get("segment_generation"),
+                    roi_frames_digest=live_roi_digest,
+                    masks_digest=live_masks_digest,
                 )
                 print(json.dumps(res, indent=2))
                 return 0
 
             if args.command == "composite":
-                roi_meta = json.loads(layout.roi_boxes_json.read_text(encoding="utf-8"))
-                audio_p = resolve_confined_audio_path(layout.prep_dir, roi_meta)
-                frame_has_edit: list[bool] | None = None
-                if layout.edit_support_json.exists():
-                    es = json.loads(layout.edit_support_json.read_text(encoding="utf-8"))
-                    if isinstance(es.get("frame_has_edit"), list):
-                        frame_has_edit = [bool(v) for v in es["frame_has_edit"]]
+                roi_meta, filenames, _, live_roi_digest = verify_prep_artifacts(layout)
+                mask_stats, live_masks_digest = verify_segment_artifacts(
+                    layout, roi_meta, filenames, live_roi_digest
+                )
+                _, frame_has_edit = verify_inpaint_artifacts(
+                    layout, roi_meta, mask_stats, filenames, live_roi_digest, live_masks_digest
+                )
+                audio_p = resolve_confined_audio_path(
+                    layout.prep_dir, roi_meta, workspace_root=layout.root
+                )
                 cmp_cfg = CompositeConfig(
                     feather_px=args.feather_px,
                     bevel_band_px=args.bevel_band_px,
@@ -564,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
                     config=cmp_cfg,
                     glare_masks_dir=layout.roi_glare_hotspot_dir,
                     audio_path=audio_p,
+                    source_video_path=args.source,
                     frame_has_edit=frame_has_edit,
                 )
                 print(json.dumps(res, indent=2))

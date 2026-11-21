@@ -141,12 +141,12 @@ class SegmentConfig:
     def __post_init__(self) -> None:
         if not self.model_id or not self.model_id.strip():
             raise ValueError("model_id must be non-empty.")
-        if self.chunk_size < 2:
-            raise ValueError(f"chunk_size must be >= 2, got {self.chunk_size}")
-        if self.chunk_overlap < 1 or self.chunk_overlap >= self.chunk_size:
+        if self.chunk_size < 3:
+            raise ValueError(f"chunk_size must be >= 3, got {self.chunk_size}")
+        if self.chunk_overlap < 2 or self.chunk_overlap >= self.chunk_size:
             raise ValueError(
-                f"chunk_overlap must satisfy 1 <= chunk_overlap < chunk_size "
-                f"({self.chunk_size}), got {self.chunk_overlap}"
+                f"chunk_overlap must satisfy 2 <= chunk_overlap < chunk_size "
+                f"({self.chunk_size}) for post-seed identity verification, got {self.chunk_overlap}"
             )
         if self.erode_px < 0:
             raise ValueError(f"erode_px must be >= 0, got {self.erode_px}")

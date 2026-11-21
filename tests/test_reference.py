@@ -314,3 +314,90 @@ def test_stitch_and_mirror_helpers_preserve_bridge_symmetry() -> None:
     img[30:35, 16:20] = (120, 220, 80)
     mir = mirror_clean_eye_across_bridge(img, clean_side="left", bridge_x=28.0, blend_half_width=3)
     assert int(mir[32, 38, 1]) > 180
+
+
+def test_reference_rejects_striped_non_eye_reflection_over_dark_skin(tmp_path: Path) -> None:
+    """Regression P1-5: striped reflection covering both lenses over dark skin must fail eye visibility."""
+    H = W = 128
+    skin_rgb = (90, 62, 46)
+    rgb = np.full((H, W, 3), skin_rgb, dtype=np.uint8)
+    lens = np.zeros((H, W), dtype=np.uint8)
+    cv2.ellipse(lens, (36, 64), (22, 15), 0, 0, 360, 255, -1)
+    cv2.ellipse(lens, (92, 64), (22, 15), 0, 0, 360, 255, -1)
+
+    # Render alternating dark/light horizontal reflection stripes across BOTH lenses (no eyes!)
+    yy, _ = np.mgrid[0:H, 0:W]
+    stripe_dark = ((yy // 4) % 2 == 0) & (lens > 127)
+    stripe_bright = ((yy // 4) % 2 == 1) & (lens > 127)
+    rgb[stripe_dark] = (45, 42, 40)
+    rgb[stripe_bright] = (145, 142, 140)
+
+    left_lens = lens.copy()
+    left_lens[:, 64:] = 0
+    right_lens = lens.copy()
+    right_lens[:, :64] = 0
+    ok_l, _ = verify_eye_visibility(rgb, left_lens, full_lens_mask=lens)
+    ok_r, _ = verify_eye_visibility(rgb, right_lens, full_lens_mask=lens)
+    assert ok_l is False and ok_r is False
+
+    roi_dir = tmp_path / "roi"
+    lens_dir = tmp_path / "lens"
+    glare_dir = tmp_path / "glare"
+    for d in (roi_dir, lens_dir, glare_dir):
+        d.mkdir(parents=True)
+    Image.fromarray(rgb).save(roi_dir / "000000.png")
+    Image.fromarray(lens).save(lens_dir / "000000.png")
+    Image.fromarray(np.zeros((H, W), dtype=np.uint8)).save(glare_dir / "000000.png")
+
+    res = build_clean_reference(
+        config=ReferenceConfig(mode="auto", max_clean_glare_pct=3.0, roi_size=128),
+        out_dir=tmp_path / "ref",
+        roi_dir=roi_dir,
+        roi_meta={"roi_size": 128, "frames": [{"frame_idx": 0, "filename": "000000.png"}]},
+        mask_stats={
+            "frames": [
+                {
+                    "frame_idx": 0,
+                    "left_lens_roi_px": 1000,
+                    "right_lens_roi_px": 1000,
+                    "glare_left_pct": 0.0,
+                    "glare_right_pct": 0.0,
+                }
+            ]
+        },
+        lens_masks_dir=lens_dir,
+        glare_masks_dir=glare_dir,
+    )
+    assert res.ref_path is None
+    assert res.strategy == "reference_free_fallback"
+
+
+def test_reference_stitch_rejects_known_glare_pixels_inside_required_lens(tmp_path: Path) -> None:
+    """Regression P1-6: even 9 known glare pixels (< 3% area) surviving in a lens must reject stitch."""
+    roi_dir, lens_dir, glare_dir, roi_meta, mask_stats = _setup_realistic_roi_set(
+        tmp_path,
+        specs=[
+            ("clean", "glared", (25, 35, 55), (40, 35, 30)),
+            ("glared", "clean", (40, 35, 30), (55, 35, 25)),
+        ],
+        glare_pairs=[(0.9, 42.0), (38.0, 0.9)],
+    )
+    # Place a tiny 3x3 (9-pixel) known glare patch inside BOTH clean lenses at identical pixel coords!
+    for idx, cx in [(0, 36), (1, 92)]:
+        fn = f"{idx:06d}.png"
+        g = np.asarray(Image.open(glare_dir / fn), dtype=np.uint8).copy()
+        g[63:66, cx - 1 : cx + 2] = 255
+        Image.fromarray(g).save(glare_dir / fn)
+
+    res = build_clean_reference(
+        config=ReferenceConfig(mode="auto", max_clean_glare_pct=3.0, allow_mirror=True, roi_size=128),
+        out_dir=tmp_path / "ref_glare9",
+        roi_dir=roi_dir,
+        roi_meta=roi_meta,
+        mask_stats=mask_stats,
+        lens_masks_dir=lens_dir,
+        glare_masks_dir=glare_dir,
+    )
+    # Neither stitch nor mirror may keep those 9 known glare pixels -> must fall back to None!
+    assert res.ref_path is None
+    assert res.strategy == "reference_free_fallback"

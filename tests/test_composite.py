@@ -304,3 +304,157 @@ def test_run_composite_stage_atomic_publish_and_failure_preserves_previous_outpu
     cmp_w, cmp_h, _ = composite.compute_compare_dimensions(W, H)
     assert len(opened_pipes[1].stdin.getvalue()) == n_frames * cmp_w * cmp_h * 3
     assert res["qa_grid"] is not None and Path(res["qa_grid"]).exists()
+
+
+def test_composite_round3_p0_p1_regressions_bridge_wide_rim_relative_src_save_frames_and_rollback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regressions P0-2, P0-4, P1-11, P1-13, P1-14."""
+    import os
+
+    # --- P1-13: narrow 6px bridge between two lenses, glare right up to left edge -> 0 px mutated in clean right lens! ---
+    H = W = 128
+    orig_b = np.full((H, W, 3), (150, 120, 100), dtype=np.uint8)
+    lens_b = np.zeros((H, W), dtype=np.uint8)
+    cv2.rectangle(lens_b, (20, 44), (60, 84), 255, -1)  # left lens x=20..60
+    cv2.rectangle(lens_b, (67, 44), (107, 84), 255, -1)  # right lens x=67..107 (6px bridge!)
+    # Glare fills entire left lens right up to x=60!
+    glare_b = np.zeros((H, W), dtype=np.uint8)
+    cv2.rectangle(glare_b, (20, 44), (60, 84), 255, -1)
+    orig_b[glare_b > 127] = (248, 250, 255)
+    # Give right lens distinctive eye texture so ANY pixel mutation shows up immediately
+    orig_b[44:85, 67:108] = (70, 95, 130)
+    clean_b = np.full((H, W, 3), (200, 50, 50), dtype=np.uint8)  # stark contrast if leaked!
+
+    comp_b, _ = composite.composite_single_frame(
+        orig_b, clean_b, lens_b, glare_b, (0, 0, W, H), feather_px=2.0, bevel_band_px=6
+    )
+    right_region = lens_b.copy()
+    right_region[:, :64] = 0
+    changed_in_clean_right = int(np.any(comp_b != orig_b, axis=2)[right_region > 127].sum())
+    assert changed_in_clean_right == 0
+
+    # --- P1-14: 6px-wide bright neutral metallic rim straddling BOTH sides of lens boundary ---
+    orig_w = np.full((H, W, 3), (150, 118, 96), dtype=np.uint8)
+    clean_w = orig_w.copy()
+    lens_w = np.zeros((H, W), dtype=np.uint8)
+    cv2.circle(lens_w, (64, 64), 30, 255, -1)
+    inner_core = np.zeros((H, W), dtype=np.uint8)
+    cv2.circle(inner_core, (64, 64), 27, 255, -1)  # 3px inside lens boundary!
+    outer_rim = np.zeros((H, W), dtype=np.uint8)
+    cv2.circle(outer_rim, (64, 64), 33, 255, -1)  # 3px outside lens boundary! (total 6px wide!)
+    rim_inner_rows = (lens_w > 127) & (inner_core == 0)
+    rim_outer_rows = (outer_rim > 127) & (lens_w == 0)
+
+    orig_w[inner_core > 127] = (242, 246, 252)
+    orig_w[rim_inner_rows | rim_outer_rows] = (232, 232, 232)  # bright neutral metallic 6px rim
+    clean_w[lens_w > 127] = (135, 105, 88)
+    clean_w[rim_inner_rows | rim_outer_rows] = (135, 105, 88)  # model erased the metallic rim!
+
+    alpha_w, _ = composite.compute_rim_safe_alpha(
+        orig_w, clean_w, lens_w, lens_w.copy(), bevel_band_px=4
+    )
+    assert float(np.median(alpha_w[rim_inner_rows])) < 0.25
+    assert float(np.median(alpha_w[rim_outer_rows])) < 0.25
+
+    # --- P0-2, P0-4, P1-11: relative source_video rejection, atomic save-frames-dir, multi-file rollback ---
+    orig_dir = tmp_path / "frames"
+    clean_dir = tmp_path / "roi_cleaned"
+    lens_dir = tmp_path / "roi_lens_exact"
+    glare_dir = tmp_path / "roi_glare"
+    for d in (orig_dir, clean_dir, lens_dir, glare_dir):
+        d.mkdir(parents=True)
+    Image.fromarray(np.full((64, 64, 3), 120, dtype=np.uint8)).save(orig_dir / "000000.png")
+    Image.fromarray(np.full((64, 64, 3), 110, dtype=np.uint8)).save(clean_dir / "000000.png")
+    Image.fromarray(np.zeros((64, 64), dtype=np.uint8)).save(lens_dir / "000000.png")
+    Image.fromarray(np.zeros((64, 64), dtype=np.uint8)).save(glare_dir / "000000.png")
+
+    rel_meta = {
+        "source_video": "relative_clip.mp4",
+        "fps": 30.0,
+        "full_width": 64,
+        "full_height": 64,
+        "frames": [{"frame_idx": 0, "filename": "000000.png", "x1": 0, "y1": 0, "x2": 64, "y2": 64}],
+    }
+    # P0-2: relative source_video in manifest MUST be rejected when --source is omitted!
+    with pytest.raises(ValueError, match="relative source_video"):
+        composite.run_composite_stage(
+            orig_frames_dir=orig_dir,
+            cleaned_roi_dir=clean_dir,
+            lens_masks_dir=lens_dir,
+            roi_meta=rel_meta,
+            output_mp4=tmp_path / "out.mp4",
+            config=CompositeConfig(),
+        )
+
+    # P0-4: --save-frames-dir must reject symlinked child target without touching outside file!
+    save_dir = tmp_path / "saved_frames"
+    save_dir.mkdir()
+    victim = tmp_path / "victim.png"
+    victim.write_bytes(b"DO_NOT_OVERWRITE")
+    (save_dir / "000000.png").symlink_to(victim)
+
+    class _DummyPipe:
+        def __init__(self, out_p: Path) -> None:
+            self.out_path = out_p
+            self.stdin = io.BytesIO()
+            self.stderr = io.BytesIO(b"")
+
+        def poll(self):
+            return None
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(composite, "open_video_writer_pipe", lambda *a, **kw: _DummyPipe(a[3]))
+    monkeypatch.setattr(
+        composite, "close_video_writer_pipe", lambda p, label="video": p.out_path.write_bytes(b"NEW")
+    )
+
+    real_src = tmp_path / "real_source.mp4"
+    real_src.write_bytes(b"SRC")
+    with pytest.raises(ValueError, match="Symlinked"):
+        composite.run_composite_stage(
+            orig_frames_dir=orig_dir,
+            cleaned_roi_dir=clean_dir,
+            lens_masks_dir=lens_dir,
+            roi_meta=rel_meta,
+            output_mp4=tmp_path / "out.mp4",
+            config=CompositeConfig(save_frames_dir=save_dir, workers=1),
+            source_video_path=real_src,
+        )
+    assert victim.read_bytes() == b"DO_NOT_OVERWRITE"
+
+    # P1-11: failure publishing compare_mp4 MUST roll back output_mp4 to its previous content!
+    out_mp4 = tmp_path / "rollback_out.mp4"
+    cmp_mp4 = tmp_path / "rollback_out_compare.mp4"
+    out_mp4.write_bytes(b"OLD_MAIN")
+    cmp_mp4.write_bytes(b"OLD_COMPARE")
+
+    real_replace = os.replace
+    replace_count = 0
+
+    def fail_on_compare_replace(src, dst):
+        nonlocal replace_count
+        if Path(dst) == cmp_mp4 and not str(src).startswith(str(tmp_path / ".bak_")):
+            replace_count += 1
+            if replace_count == 1:
+                raise OSError("simulated compare publish failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(composite.os, "replace", fail_on_compare_replace)
+    with pytest.raises(OSError, match="simulated compare publish failure"):
+        composite.run_composite_stage(
+            orig_frames_dir=orig_dir,
+            cleaned_roi_dir=clean_dir,
+            lens_masks_dir=lens_dir,
+            roi_meta=rel_meta,
+            output_mp4=out_mp4,
+            config=CompositeConfig(compare=True, workers=1),
+            source_video_path=real_src,
+        )
+    assert out_mp4.read_bytes() == b"OLD_MAIN"
+    assert cmp_mp4.read_bytes() == b"OLD_COMPARE"

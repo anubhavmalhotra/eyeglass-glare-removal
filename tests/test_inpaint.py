@@ -246,14 +246,19 @@ def test_sdpa_guard_cuda_and_cpu_and_gpu_lock(tmp_path: Path) -> None:
 
 
 def test_safetensors_prompt_embed_cache_roundtrip_and_validation(tmp_path: Path) -> None:
-    """Regression P0-6: embedding cache uses tensor-only Safetensors & rejects malformed files."""
+    """Regression P0-6 & P1-3: Safetensors cache enforces batch=1, exact seq_len, hidden_dim, dtype, finiteness."""
     torch = pytest.importorskip("torch")
     cache_p = tmp_path / "embeds.safetensors"
     pe = torch.randn((1, 8, 16), dtype=torch.float32)
     npe = torch.randn((1, 8, 16), dtype=torch.float32)
 
     inpaint.save_prompt_embeds_safetensors(cache_p, pe, npe)
-    loaded = inpaint.load_prompt_embeds_safetensors(cache_p)
+    # Default VACE expectations (seq=512, hidden=4096) MUST reject mismatched (1, 8, 16) tensors!
+    assert inpaint.load_prompt_embeds_safetensors(cache_p) is None
+
+    loaded = inpaint.load_prompt_embeds_safetensors(
+        cache_p, expected_seq_len=8, expected_hidden_dim=16
+    )
     assert loaded is not None
     assert torch.allclose(loaded[0], pe)
     assert torch.allclose(loaded[1], npe)
@@ -261,12 +266,133 @@ def test_safetensors_prompt_embed_cache_roundtrip_and_validation(tmp_path: Path)
     # Corrupted / non-safetensors file must be rejected safely (never unpickled)
     bad_p = tmp_path / "bad.safetensors"
     bad_p.write_bytes(b"corrupt_pickle_or_garbage")
-    assert inpaint.load_prompt_embeds_safetensors(bad_p) is None
+    assert (
+        inpaint.load_prompt_embeds_safetensors(bad_p, expected_seq_len=8, expected_hidden_dim=16)
+        is None
+    )
 
-    # Wrong tensor rank / NaN values must be rejected
+    # Wrong tensor rank / NaN values / wrong width / wrong seq_len / wrong batch / int dtype rejected
     from safetensors.torch import save_file
 
     nan_p = tmp_path / "nan.safetensors"
     bad_t = torch.full((1, 8, 16), float("nan"))
     save_file({"prompt_embeds": bad_t, "negative_prompt_embeds": npe}, str(nan_p))
-    assert inpaint.load_prompt_embeds_safetensors(nan_p) is None
+    assert (
+        inpaint.load_prompt_embeds_safetensors(nan_p, expected_seq_len=8, expected_hidden_dim=16)
+        is None
+    )
+
+    assert (
+        inpaint.load_prompt_embeds_safetensors(cache_p, expected_seq_len=8, expected_hidden_dim=32)
+        is None
+    )
+    assert (
+        inpaint.load_prompt_embeds_safetensors(cache_p, expected_seq_len=16, expected_hidden_dim=16)
+        is None
+    )
+    bad_batch_p = tmp_path / "bad_batch.safetensors"
+    b2 = torch.randn((2, 8, 16), dtype=torch.float32)
+    save_file({"prompt_embeds": b2, "negative_prompt_embeds": b2.clone()}, str(bad_batch_p))
+    assert (
+        inpaint.load_prompt_embeds_safetensors(
+            bad_batch_p, expected_seq_len=8, expected_hidden_dim=16
+        )
+        is None
+    )
+
+    bad_dtype_p = tmp_path / "bad_dtype.safetensors"
+    i_t = torch.zeros((1, 8, 16), dtype=torch.int32)
+    save_file({"prompt_embeds": i_t, "negative_prompt_embeds": i_t.clone()}, str(bad_dtype_p))
+    assert (
+        inpaint.load_prompt_embeds_safetensors(
+            bad_dtype_p, expected_seq_len=8, expected_hidden_dim=16
+        )
+        is None
+    )
+
+
+def test_inpaint_round3_p1_regressions_fingerprint_bnb_cache_key_standalone_umt5_and_schema(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regressions P1-1, P1-2, P1-3, P1-4, P1-12."""
+    import sys
+    import types
+
+    # --- P1-1: changing device alters compute_run_fingerprint ---
+    fp_cuda = inpaint.compute_run_fingerprint(InpaintConfig(device="cuda:0"), None, inputs_digest="d")
+    fp_cpu = inpaint.compute_run_fingerprint(InpaintConfig(device="cpu"), None, inputs_digest="d")
+    assert fp_cuda != fp_cpu
+
+    # --- P1-3: structured cache key distinguishes multiline prompt pairs & encoder revisions ---
+    k1 = inpaint.compute_embed_cache_key(
+        "org/model", "a\nb", "c", encoder_revision="rev1", max_sequence_length=512, dtype_str="bf16"
+    )
+    k2 = inpaint.compute_embed_cache_key(
+        "org/model", "a", "b\nc", encoder_revision="rev1", max_sequence_length=512, dtype_str="bf16"
+    )
+    k3 = inpaint.compute_embed_cache_key(
+        "org/model", "a\nb", "c", encoder_revision="rev2", max_sequence_length=512, dtype_str="bf16"
+    )
+    k4 = inpaint.compute_embed_cache_key(
+        "org/model", "a\nb", "c", encoder_revision="rev1", max_sequence_length=256, dtype_str="bf16"
+    )
+    assert len({k1, k2, k3, k4}) == 4
+
+    # --- P1-12: malformed done.json (null, [], bad types) returns False without crashing ---
+    cdir = tmp_path / "chunk_0000"
+    cdir.mkdir()
+    for bad_json in ("null", "[]", '"str"', '{"num_frames": "bad"}', '{"num_frames": true}'):
+        (cdir / "done.json").write_text(bad_json, encoding="utf-8")
+        assert is_chunk_complete(cdir, 4) is False
+
+    # --- P1-2: broken CUDA bitsandbytes NF4 backend fails BEFORE UMT5/VAE allocation ---
+    fake_torch = types.ModuleType("torch")
+    fake_torch.zeros = lambda shape, device=None, dtype=None: ("zeros", shape, device, dtype)
+    fake_bnb = types.ModuleType("bitsandbytes")
+
+    class FakeBnbFunc:
+        @staticmethod
+        def quantize_4bit(*_a, **_kw):
+            raise RuntimeError("libcudart.so missing")
+
+    fake_bnb.functional = FakeBnbFunc
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", fake_bnb)
+    with pytest.raises(RuntimeError, match="native CUDA NF4 preflight failed"):
+        inpaint._validate_quantization_prereqs(True, SimpleNamespace(type="cuda"), "bf16")
+
+    # --- P1-4: standalone UMT5 repo (without model_index.json) falls back to AutoTokenizer+UMT5 ---
+    called_standalone: dict[str, str] = {}
+
+    class FakeWanVACEPipeline:
+        def __init__(self, **kw):
+            self.kwargs = kw
+
+        @classmethod
+        def from_pretrained(cls, model_id, **_kw):
+            raise OSError(f"Error no file named model_index.json found in {model_id}")
+
+    class FakeAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_id):
+            called_standalone["tokenizer"] = model_id
+            return "TOK"
+
+    class FakeUMT5:
+        @classmethod
+        def from_pretrained(cls, model_id, **_kw):
+            called_standalone["encoder"] = model_id
+            return "ENC"
+
+    fake_diffusers = types.ModuleType("diffusers")
+    fake_diffusers.WanVACEPipeline = FakeWanVACEPipeline
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = FakeAutoTokenizer
+    fake_transformers.UMT5EncoderModel = FakeUMT5
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    pipe = inpaint._load_text_encoder_pipeline("google/umt5-xxl", "bf16")
+    assert called_standalone == {"tokenizer": "google/umt5-xxl", "encoder": "google/umt5-xxl"}
+    assert pipe.kwargs["tokenizer"] == "TOK"
+    assert pipe.kwargs["text_encoder"] == "ENC"

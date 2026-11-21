@@ -97,7 +97,8 @@ def test_parse_ffprobe_rotated_and_primary_stream_selection() -> None:
     assert meta.rotation == 270
     assert meta.display_width == 720
     assert meta.display_height == 1280
-    assert meta.sample_aspect_ratio == "4:3"
+    # Quarter-turn autorotation (-90 / 270) MUST invert coded SAR 4:3 -> display SAR 3:4!
+    assert meta.sample_aspect_ratio == "3:4"
     assert meta.color_primaries == "smpte170m"
     assert meta.has_audio is True
 
@@ -240,9 +241,34 @@ def test_build_video_writer_cmd_preserves_sar_color_no_shortest_and_lossless(
     assert "-t" in cmd and cmd[cmd.index("-t") + 1] == "10.000000"
     vf = cmd[cmd.index("-vf") + 1]
     assert "pad=ceil(iw/2)*2:ceil(ih/2)*2" in vf
-    assert "setsar=4/3" in vf
+    assert "setsar=sar=4/3:max=100000" in vf
+    assert "scale=out_color_matrix=smpte170m:out_range=tv" in vf
     assert cmd[cmd.index("-color_primaries") + 1] == "smpte170m"
     assert cmd[-1].startswith("file:/")
+
+    # Unknown color primaries/trc MUST NOT be fabricated as bt709; pc range preserved
+    cmd_unknown = media.build_video_writer_cmd(
+        640,
+        480,
+        30.0,
+        out_mp4,
+        color_primaries="unknown",
+        color_trc=None,
+        colorspace="unknown",
+        color_range="pc",
+    )
+    assert "-color_primaries" not in cmd_unknown
+    assert "-color_trc" not in cmd_unknown
+    assert cmd_unknown[cmd_unknown.index("-color_range") + 1] == "pc"
+    assert "out_range=pc" in cmd_unknown[cmd_unknown.index("-vf") + 1]
+
+    # Non-zero A/V offset must inject -itsoffset before audio input
+    cmd_off = media.build_video_writer_cmd(
+        640, 480, 30.0, out_mp4, audio_path=audio_file, audio_offset_sec=0.25
+    )
+    itsoff_idx = cmd_off.index("-itsoffset")
+    assert cmd_off[itsoff_idx + 1] == "0.250000"
+    assert cmd_off[itsoff_idx + 2] == "-i"
 
     cmd_lossless = media.build_video_writer_cmd(
         641, 481, 30.0, out_mp4, lossless=True
@@ -250,7 +276,92 @@ def test_build_video_writer_cmd_preserves_sar_color_no_shortest_and_lossless(
     assert cmd_lossless[cmd_lossless.index("-c:v") + 1] == "libx264rgb"
     assert cmd_lossless[cmd_lossless.index("-crf") + 1] == "0"
     assert cmd_lossless[cmd_lossless.index("-pix_fmt") + 1] == "rgb24"
+    assert cmd_lossless[cmd_lossless.index("-color_range") + 1] == "pc"
+    assert cmd_lossless[cmd_lossless.index("-colorspace") + 1] == "rgb"
     assert "-vf" not in cmd_lossless
+
+
+def test_extract_cfr_frames_refuses_source_inside_or_aliased_to_workdir(tmp_path: Path) -> None:
+    """Regression P0-1: prep must reject source inside out_dir or hardlinked to audio.m4a before writing."""
+    import os
+
+    out_dir = tmp_path / "prep"
+    frames_dir = out_dir / "frames"
+    frames_dir.mkdir(parents=True)
+
+    # 1) Source stored inside prep/frames -> refused BEFORE any unlink/rmtree!
+    inside_src = frames_dir / "input.mp4"
+    inside_src.write_bytes(b"PRECIOUS_SOURCE_BYTES")
+    with pytest.raises(ValueError, match="resides inside managed workspace"):
+        media.extract_cfr_frames(inside_src, out_dir)
+    assert inside_src.read_bytes() == b"PRECIOUS_SOURCE_BYTES"
+
+    # 2) Source hardlinked to out_dir/audio.m4a -> refused BEFORE audio.m4a unlink!
+    ext_src = tmp_path / "external_source.mp4"
+    ext_src.write_bytes(b"PRECIOUS_AUDIO_LINKED_SOURCE")
+    audio_alias = out_dir / "audio.m4a"
+    os.link(ext_src, audio_alias)
+    with pytest.raises(ValueError, match="aliases"):
+        media.extract_cfr_frames(ext_src, out_dir)
+    assert ext_src.read_bytes() == b"PRECIOUS_AUDIO_LINKED_SOURCE"
+    assert audio_alias.exists()
+
+
+def test_percent_escaping_and_audio_offset_and_strict_packet_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regressions P1-16 & P1-17: literal '%' path escaping, A/V offset math, strict packet count."""
+    pct_dir = tmp_path / "clip_100%_test" / "frames"
+    pct_dir.mkdir(parents=True)
+    pat = media.ffmpeg_image2_pattern(pct_dir, "%06d.png")
+    assert "clip_100%%_test" in pat
+    assert pat.endswith("/%06d.png")
+
+    meta_av = media.VideoMetadata(
+        path="av.mp4",
+        width=640,
+        height=480,
+        display_width=640,
+        display_height=480,
+        rotation=0,
+        fps=30.0,
+        is_vfr=False,
+        duration_sec=5.0,
+        has_audio=True,
+        video_start_time=0.0,
+        audio_start_time=0.35,
+    )
+    assert media.compute_audio_offset_sec(meta_av, start_sec=0.0) == pytest.approx(0.35)
+    assert media.compute_audio_offset_sec(meta_av, start_sec=0.5) == pytest.approx(0.0)
+
+    # probe_audio_has_packets MUST reject positive duration with 0 / missing packets!
+    monkeypatch.setattr(media, "require_binary", lambda name: f"/usr/bin/{name}")
+    audio_p = tmp_path / "empty.m4a"
+    audio_p.write_bytes(b"header_only")
+
+    monkeypatch.setattr(
+        media,
+        "run_subprocess",
+        lambda cmd, check=True: subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout='{"streams": [{"codec_type": "audio", "duration": "2.5", "nb_read_packets": "0"}]}',
+            stderr="",
+        ),
+    )
+    assert media.probe_audio_has_packets(audio_p) is False
+
+    monkeypatch.setattr(
+        media,
+        "run_subprocess",
+        lambda cmd, check=True: subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout='{"streams": [{"codec_type": "audio", "duration": "2.5", "nb_read_packets": "42"}]}',
+            stderr="",
+        ),
+    )
+    assert media.probe_audio_has_packets(audio_p) is True
 
 
 def test_run_subprocess_rejects_empty_cmd() -> None:

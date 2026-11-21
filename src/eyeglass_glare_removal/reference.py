@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,9 +14,11 @@ import numpy as np
 from PIL import Image
 
 from eyeglass_glare_removal._workspace import (
+    atomic_swap_directory,
     atomic_write_text,
     ensure_safe_child_file,
-    make_unique_temp_sibling,
+    hash_file_sha256,
+    make_unique_temp_dir,
     reject_symlink_path,
     validate_safe_basename,
 )
@@ -43,6 +45,9 @@ class ReferenceResult:
     left_glare_pct: float | None = None
     right_glare_pct: float | None = None
     bridge_x: float | None = None
+    prep_generation: str | None = None
+    segment_generation: str | None = None
+    ref_sha256: str | None = None
     details: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -138,19 +143,41 @@ def verify_eye_visibility(
     full_lens_mask: np.ndarray | None = None,
 ) -> tuple[bool, dict[str, float]]:
     """
-    Require positive eye-visibility evidence inside `eye_mask` before accepting a candidate
-    as a clean reference eye (prevents washed-out or fogged reflections from passing).
+    Require positive, spatially localized eye-visibility evidence inside the central
+    iris/eyelid region of `eye_mask` before accepting a candidate as a clean reference.
 
-    Checks:
-      1) Dynamic range (`p90_L - p10_L >= 18.0`): rejects uniform/washed-out reflections.
-      2) Dark iris/pupil/lash presence (`p10_L <= min(125.0, skin_L + 15.0)`): rejects bright
-         uniform sheets covering the eye.
-      3) Not globally washed out vs surrounding face skin (`med_L <= min(225.0, skin_L + 45.0)`).
-      4) Structural gradient/edge energy present (`grad_p75 >= 4.0`).
+    Rejects both washed-out uniform glare sheets AND non-eye periodic/striped reflections
+    spanning the lens:
+      1) Central eye zone dynamic range (`p90 - p10 >= 18.0`) & non-washout median luminance.
+      2) Localized compact dark iris/pupil cluster centered inside the central eye zone
+         (bounded width/height & aspect ratio, NOT edge-to-edge stripes).
+      3) Non-stripe / non-reflection periphery check: rejects periodic stripe patterns where
+         the outer lens periphery mirrors the same high contrast / dark-bright alternation as
+         the central eye zone.
     """
     region = eye_mask > 127
-    if int(region.sum()) < 40:
-        return False, {"area": float(region.sum())}
+    lens_area = int(region.sum())
+    if lens_area < 40:
+        return False, {"area": float(lens_area)}
+
+    ys, xs = np.where(region)
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    bw = max(1, x2 - x1 + 1)
+    bh = max(1, y2 - y1 + 1)
+
+    H, W = eye_mask.shape[:2]
+    central_box = np.zeros((H, W), dtype=bool)
+    cx1 = x1 + int(round(0.18 * bw))
+    cx2 = x1 + int(round(0.82 * bw))
+    cy1 = y1 + int(round(0.16 * bh))
+    cy2 = y1 + int(round(0.84 * bh))
+    central_box[cy1 : max(cy1 + 1, cy2), cx1 : max(cx1 + 1, cx2)] = True
+    central_zone = region & central_box
+    periph_zone = region & (~central_box)
+
+    if int(central_zone.sum()) < 20:
+        return False, {"central_area": float(central_zone.sum())}
 
     ref_mask = full_lens_mask if full_lens_mask is not None else eye_mask
     skin_stats = estimate_local_skin_stats(roi_rgb, ref_mask)
@@ -158,39 +185,100 @@ def verify_eye_visibility(
 
     bgr = roi_rgb[:, :, ::-1]
     L = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
-    L_vals = L[region]
+    L_c = L[central_zone]
 
-    p10 = float(np.percentile(L_vals, 10))
-    p50 = float(np.median(L_vals))
-    p90 = float(np.percentile(L_vals, 90))
-    dyn_range = p90 - p10
+    p10_c = float(np.percentile(L_c, 10))
+    p50_c = float(np.median(L_c))
+    p75_c = float(np.percentile(L_c, 75))
+    p90_c = float(np.percentile(L_c, 90))
+    dyn_range = p90_c - p10_c
 
     gx = cv2.Sobel(L, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
     grad = cv2.magnitude(gx, gy) / 4.0
-    grad_p75 = float(np.percentile(grad[region], 75))
+    grad_p75 = float(np.percentile(grad[central_zone], 75))
+
+    has_contrast = dyn_range >= 18.0
+    has_dark_iris_level = p10_c <= min(115.0, skin_L + 10.0)
+    not_washed_out = p50_c <= min(225.0, skin_L + 40.0)
+    has_structure = grad_p75 >= 4.0
+
+    # Locate dark iris/pupil connected components across the entire lens so edge-to-edge stripes
+    # cannot impersonate a compact central iris blob!
+    dark_thresh = min(115.0, skin_L + 5.0, p75_c - 15.0)
+    dark_mask = (L <= dark_thresh) & region
+    n_dc, _, d_stats, d_centroids = cv2.connectedComponentsWithStats(
+        dark_mask.astype(np.uint8), connectivity=8
+    )
+
+    compact_central_iris = False
+    spanning_stripes = 0
+    for cid in range(1, n_dc):
+        area = int(d_stats[cid, cv2.CC_STAT_AREA])
+        cw = int(d_stats[cid, cv2.CC_STAT_WIDTH])
+        ch = int(d_stats[cid, cv2.CC_STAT_HEIGHT])
+        ccx, ccy = float(d_centroids[cid][0]), float(d_centroids[cid][1])
+
+        if cw >= 0.75 * bw or ch >= 0.78 * bh:
+            spanning_stripes += 1
+            continue
+
+        aspect = float(cw) / float(max(1, ch))
+        in_center = (x1 + 0.22 * bw <= ccx <= x1 + 0.78 * bw) and (
+            y1 + 0.20 * bh <= ccy <= y1 + 0.80 * bh
+        )
+        if (
+            in_center
+            and 10 <= area <= int(0.42 * lens_area)
+            and cw <= 0.65 * bw
+            and ch <= 0.72 * bh
+            and 0.35 <= aspect <= 2.8
+        ):
+            compact_central_iris = True
+
+    # Reject periodic/striped full-lens reflection patterns:
+    # 1) Multiple dark bands spanning across the full lens width/height, OR
+    # 2) Outer lens periphery has high glare-like contrast/variance matching the center
+    #    (in a real eye, the iris & sclera contrast sit in the center while the periphery is
+    #     predominantly smooth skin/eyelid).
+    periph_non_eye = False
+    if int(periph_zone.sum()) >= 30:
+        L_p = L[periph_zone]
+        periph_dyn = float(np.percentile(L_p, 90) - np.percentile(L_p, 10))
+        periph_grad = float(np.percentile(grad[periph_zone], 75))
+        bright_frac_all = float((L[region] > skin_L + 35.0).mean())
+        if (periph_dyn >= 0.75 * dyn_range and periph_grad >= 0.75 * grad_p75) or (
+            bright_frac_all >= 0.35
+        ):
+            periph_non_eye = True
+
+    is_localized_eye = compact_central_iris and (spanning_stripes == 0) and (not periph_non_eye)
 
     metrics = {
         "skin_L": round(skin_L, 2),
-        "p10_L": round(p10, 2),
-        "p50_L": round(p50, 2),
-        "p90_L": round(p90, 2),
+        "p10_L": round(p10_c, 2),
+        "p50_L": round(p50_c, 2),
+        "p90_L": round(p90_c, 2),
         "dyn_range": round(dyn_range, 2),
         "grad_p75": round(grad_p75, 2),
+        "compact_iris": float(compact_central_iris),
+        "spanning_stripes": float(spanning_stripes),
+        "periph_non_eye": float(periph_non_eye),
     }
 
-    has_contrast = dyn_range >= 18.0
-    has_dark_iris = p10 <= min(125.0, skin_L + 15.0)
-    not_washed_out = p50 <= min(225.0, skin_L + 45.0)
-    has_structure = grad_p75 >= 4.0
-
-    return (has_contrast and has_dark_iris and not_washed_out and has_structure), metrics
+    ok = (
+        has_contrast
+        and has_dark_iris_level
+        and not_washed_out
+        and has_structure
+        and is_localized_eye
+    )
+    return ok, metrics
 
 
 def _fallback_eye_box_mask(
     roi_size: int, side: str, roi_meta: dict[str, Any] | None
 ) -> np.ndarray:
-    """Fallback eye region mask if lens mask PNGs are unavailable on disk."""
     m = np.zeros((roi_size, roi_size), dtype=np.uint8)
     geom = roi_meta.get("init_eye_geometry_roi") if isinstance(roi_meta, dict) else None
     if isinstance(geom, dict) and "left_eye" in geom and "right_eye" in geom:
@@ -206,7 +294,7 @@ def _fallback_eye_box_mask(
     return m
 
 
-def stitch_left_right_roi(
+def _stitch_with_glare_tracking(
     left_rgb: np.ndarray,
     right_rgb: np.ndarray,
     bridge_x: float,
@@ -216,16 +304,16 @@ def stitch_left_right_roi(
     right_glare_mask: np.ndarray | None = None,
     left_lens_mask: np.ndarray | None = None,
     right_lens_mask: np.ndarray | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Seamlessly stitch the clean left half of `left_rgb` with the clean right half of `right_rgb`
-    across `bridge_x`, strictly preventing rejected-side glare from bleeding across the seam.
+    Stitch left half of `left_rgb` and right half of `right_rgb` across `bridge_x`,
+    enforcing source-glare exclusion LAST (after smoothing and lens assignment) and
+    returning `(stitched_rgb, carried_known_glare_bool)`.
     """
     H, W = left_rgb.shape[:2]
     if right_rgb.shape[:2] != (H, W):
         right_rgb = cv2.resize(right_rgb, (W, H), interpolation=cv2.INTER_LANCZOS4)
 
-    # Narrow blend band so it never crosses into either lens mask when provided
     eff_bw = float(max(1, blend_half_width))
     if left_lens_mask is not None and int((left_lens_mask > 127).sum()) > 0:
         l_xs = np.where(left_lens_mask > 127)[1]
@@ -240,34 +328,59 @@ def stitch_left_right_roi(
     t = np.clip((xs - (bridge_x - eff_bw)) / (2.0 * max(1.0, eff_bw)), 0.0, 1.0)
     w_right_2d = np.broadcast_to((0.5 * (1.0 - np.cos(np.pi * t)))[None, :], (H, W)).copy()
 
-    # Constrain using per-eye lens and glare masks so rejected-side glare never bleeds in
-    if left_glare_mask is not None:
-        g_l = left_glare_mask > 32
-        # On right side of bridge, glare in left_rgb must be 100% replaced by right_rgb
-        w_right_2d = np.where(g_l & (xs[None, :] >= bridge_x - eff_bw), 1.0, w_right_2d)
-    if right_glare_mask is not None:
-        g_r = right_glare_mask > 32
-        # On left side of bridge, glare in right_rgb must be 100% excluded (keep left_rgb)
-        w_right_2d = np.where(g_r & (xs[None, :] <= bridge_x + eff_bw), 0.0, w_right_2d)
     if left_lens_mask is not None:
         w_right_2d = np.where(left_lens_mask > 127, 0.0, w_right_2d)
     if right_lens_mask is not None:
         w_right_2d = np.where(right_lens_mask > 127, 1.0, w_right_2d)
 
     w_right_2d = cv2.GaussianBlur(w_right_2d.astype(np.float32), (3, 3), 0.7)
-    # Re-enforce hard lens and glare exclusion after smoothing so zero glare bleeds across seam
-    if left_glare_mask is not None:
-        w_right_2d = np.where((left_glare_mask > 32) & (xs[None, :] >= bridge_x - eff_bw), 1.0, w_right_2d)
-    if right_glare_mask is not None:
-        w_right_2d = np.where((right_glare_mask > 32) & (xs[None, :] <= bridge_x + eff_bw), 0.0, w_right_2d)
+
+    # Re-apply lens ownership, THEN enforce source-glare exclusion LAST so lens masks NEVER
+    # re-introduce known glare when the alternate source offers a clean pixel!
     if left_lens_mask is not None:
         w_right_2d = np.where(left_lens_mask > 127, 0.0, w_right_2d)
     if right_lens_mask is not None:
         w_right_2d = np.where(right_lens_mask > 127, 1.0, w_right_2d)
 
-    w_right = np.clip(w_right_2d, 0.0, 1.0)[:, :, None]
+    g_l = (left_glare_mask > 32) if left_glare_mask is not None else np.zeros((H, W), dtype=bool)
+    g_r = (right_glare_mask > 32) if right_glare_mask is not None else np.zeros((H, W), dtype=bool)
+
+    # Whenever left is glared and right is clean -> strictly take right (1.0);
+    # whenever right is glared and left is clean -> strictly take left (0.0).
+    w_right_2d = np.where(g_l & (~g_r), 1.0, w_right_2d)
+    w_right_2d = np.where(g_r & (~g_l), 0.0, w_right_2d)
+
+    w_right_2d = np.clip(w_right_2d, 0.0, 1.0)
+    carried_glare = ((w_right_2d < 0.99) & g_l) | ((w_right_2d > 0.01) & g_r)
+
+    w_right = w_right_2d[:, :, None]
     blended = left_rgb.astype(np.float32) * (1.0 - w_right) + right_rgb.astype(np.float32) * w_right
-    return np.clip(blended, 0.0, 255.0).round().astype(np.uint8)
+    return np.clip(blended, 0.0, 255.0).round().astype(np.uint8), carried_glare
+
+
+def stitch_left_right_roi(
+    left_rgb: np.ndarray,
+    right_rgb: np.ndarray,
+    bridge_x: float,
+    blend_half_width: int = 12,
+    *,
+    left_glare_mask: np.ndarray | None = None,
+    right_glare_mask: np.ndarray | None = None,
+    left_lens_mask: np.ndarray | None = None,
+    right_lens_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Seamlessly stitch clean left and right halves across `bridge_x`, excluding known glare."""
+    stitched, _ = _stitch_with_glare_tracking(
+        left_rgb,
+        right_rgb,
+        bridge_x=bridge_x,
+        blend_half_width=blend_half_width,
+        left_glare_mask=left_glare_mask,
+        right_glare_mask=right_glare_mask,
+        left_lens_mask=left_lens_mask,
+        right_lens_mask=right_lens_mask,
+    )
+    return stitched
 
 
 def _mirror_array_across_x(arr: np.ndarray, bridge_x: float, interp: int) -> np.ndarray:
@@ -280,7 +393,7 @@ def _mirror_array_across_x(arr: np.ndarray, bridge_x: float, interp: int) -> np.
     return cv2.remap(arr, map_x, map_y, interpolation=interp, borderMode=cv2.BORDER_REPLICATE)
 
 
-def mirror_clean_eye_across_bridge(
+def _mirror_with_glare_tracking(
     rgb: np.ndarray,
     clean_side: str,
     bridge_x: float,
@@ -288,11 +401,7 @@ def mirror_clean_eye_across_bridge(
     *,
     glare_mask: np.ndarray | None = None,
     clean_lens_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Mirror the clean eye half across the vertical nose-bridge axis x = bridge_x,
-    explicitly excluding known glare pixels on the rejected half from bleeding across the seam.
-    """
+) -> tuple[np.ndarray, np.ndarray]:
     if clean_side not in ("left", "right"):
         raise ValueError(f"clean_side must be 'left' or 'right', got {clean_side!r}")
 
@@ -309,7 +418,7 @@ def mirror_clean_eye_across_bridge(
     )
 
     if clean_side == "left":
-        return stitch_left_right_roi(
+        return _stitch_with_glare_tracking(
             rgb,
             mirrored,
             bridge_x=bridge_x,
@@ -319,7 +428,7 @@ def mirror_clean_eye_across_bridge(
             left_lens_mask=clean_lens_mask,
             right_lens_mask=mir_lens,
         )
-    return stitch_left_right_roi(
+    return _stitch_with_glare_tracking(
         mirrored,
         rgb,
         bridge_x=bridge_x,
@@ -329,6 +438,27 @@ def mirror_clean_eye_across_bridge(
         left_lens_mask=mir_lens,
         right_lens_mask=clean_lens_mask,
     )
+
+
+def mirror_clean_eye_across_bridge(
+    rgb: np.ndarray,
+    clean_side: str,
+    bridge_x: float,
+    blend_half_width: int = 12,
+    *,
+    glare_mask: np.ndarray | None = None,
+    clean_lens_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Mirror the clean eye half across `bridge_x`, strictly excluding rejected-side glare."""
+    mir, _ = _mirror_with_glare_tracking(
+        rgb,
+        clean_side=clean_side,
+        bridge_x=bridge_x,
+        blend_half_width=blend_half_width,
+        glare_mask=glare_mask,
+        clean_lens_mask=clean_lens_mask,
+    )
+    return mir
 
 
 def _frame_sharpness(roi_rgb: np.ndarray) -> float:
@@ -344,12 +474,7 @@ def select_clean_eye_candidates(
     sharpness_fn: Any = None,
     visibility_fn: Any = None,
 ) -> tuple[int | None, int | None, int | None]:
-    """
-    Scan per-frame segmentation stats + positive eye-visibility checks to find clean eye frames.
-
-    `visibility_fn(frame_idx, side) -> bool`: verifies positive eye/iris/contrast structure
-    inside the candidate eye so undetected uniform washouts can NEVER pass as clean.
-    """
+    """Scan per-frame segmentation stats + localized eye-visibility checks for clean eye frames."""
     if not frame_stats:
         return None, None, None
 
@@ -423,13 +548,20 @@ def _verify_synthesized_reference(
     left_lens_mask: np.ndarray,
     right_lens_mask: np.ndarray,
     max_clean_glare_pct: float,
+    carried_glare: np.ndarray | None = None,
 ) -> tuple[bool, float, float]:
     """
-    Validate a stitched/mirrored reference image before saving:
-    checks both photometric glare % AND positive eye visibility on both lenses.
+    Validate a stitched/mirrored reference before saving:
+    - Reject immediately if ANY known source glare pixel survived inside either required eye lens.
+    - Verify re-detected photometric glare % is within `max_clean_glare_pct`.
+    - Verify localized eye visibility on both lenses.
     """
     union_lens = np.maximum(left_lens_mask, right_lens_mask)
     if int((union_lens > 127).sum()) == 0:
+        return False, 100.0, 100.0
+
+    # Zero tolerance for carried-over known source glare pixels inside either required eye region!
+    if carried_glare is not None and int((carried_glare & (union_lens > 127)).sum()) > 0:
         return False, 100.0, 100.0
 
     glare = compute_glare_hotspot_mask(synth_rgb, union_lens, dilate_px=2, feather_sigma=1.0)
@@ -446,16 +578,6 @@ def _verify_synthesized_reference(
     return (vis_l and vis_r), gl_pct, gr_pct
 
 
-def _save_png_atomic(rgb: np.ndarray, dest: Path) -> None:
-    tmp = make_unique_temp_sibling(dest)
-    try:
-        Image.fromarray(rgb).save(tmp, format="PNG")
-        os.replace(tmp, dest)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
 def build_clean_reference(
     *,
     config: ReferenceConfig,
@@ -466,46 +588,68 @@ def build_clean_reference(
     lens_masks_dir: Path | None = None,
     glare_masks_dir: Path | None = None,
 ) -> ReferenceResult:
-    """
-    Execute Stage 3: construct a verified clean-eye reference image or gracefully return None.
-
-    Requires positive eye-visibility evidence on candidates AND verifies any stitched/mirrored
-    result before saving so glared or washed-out frames are NEVER fed to VACE as a reference.
-    """
+    """Execute Stage 3 with upstream generation validation, localized eye checks, and atomic publish."""
     out_dir = Path(out_dir)
     reject_symlink_path(out_dir, "reference output directory")
-    out_dir.mkdir(parents=True, exist_ok=True)
     ref_out = out_dir / "clean_eye_ref.png"
-    meta_out = out_dir / "reference_meta.json"
     reject_symlink_path(ref_out, "clean_eye_ref.png")
 
-    def _save_meta(res: ReferenceResult) -> ReferenceResult:
-        atomic_write_text(meta_out, json.dumps(res.to_dict(), indent=2))
-        return res
+    prep_gen = roi_meta.get("prep_generation") if isinstance(roi_meta, dict) else None
+    seg_gen = mask_stats.get("segment_generation") if isinstance(mask_stats, dict) else None
+
+    # Verify upstream generation chain consistency when both prep and segment manifests are present
+    if isinstance(roi_meta, dict) and isinstance(mask_stats, dict):
+        ms_prep = mask_stats.get("prep_generation")
+        if prep_gen and ms_prep and ms_prep != prep_gen:
+            raise ValueError(
+                f"Workspace generation mismatch in reference stage: masks prep_generation "
+                f"({ms_prep}) != prep roi_boxes.json ({prep_gen}). Rerun segment first."
+            )
+
+    def _publish_ref(rgb: np.ndarray | None, res: ReferenceResult) -> ReferenceResult:
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        stage_dir = make_unique_temp_dir(out_dir.parent, prefix=f".stage_{out_dir.name}_")
+        try:
+            if rgb is not None:
+                stage_png = stage_dir / "clean_eye_ref.png"
+                Image.fromarray(rgb).save(stage_png, format="PNG")
+                res.ref_sha256 = hash_file_sha256(stage_png)
+                res.ref_path = ref_out
+            else:
+                res.ref_path = None
+                res.ref_sha256 = None
+            res.prep_generation = prep_gen
+            res.segment_generation = seg_gen
+            atomic_write_text(stage_dir / "reference_meta.json", json.dumps(res.to_dict(), indent=2))
+            atomic_swap_directory(stage_dir, out_dir)
+            return res
+        except BaseException:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
 
     if config.mode == "none":
-        if ref_out.exists():
-            ref_out.unlink()
-        return _save_meta(
+        return _publish_ref(
+            None,
             ReferenceResult(
                 mode="none",
                 strategy="disabled",
                 ref_path=None,
                 details="Reference image disabled (--no-ref); running reference-free VACE.",
-            )
+            ),
         )
 
     if config.mode == "image":
         assert config.ref_image_path is not None
         rgb, auto_cropped = _prepare_user_reference_image(config.ref_image_path, config.roi_size)
-        _save_png_atomic(rgb, ref_out)
-        return _save_meta(
+        return _publish_ref(
+            rgb,
             ReferenceResult(
                 mode="image",
                 strategy="user_image_cropped" if auto_cropped else "user_image_direct",
                 ref_path=ref_out,
                 details=f"Loaded user reference from {config.ref_image_path} (auto_cropped={auto_cropped}).",
-            )
+            ),
         )
 
     if roi_dir is None or mask_stats is None or roi_meta is None:
@@ -588,12 +732,11 @@ def build_clean_reference(
         visibility_fn=_visibility,
     )
 
-    # Case 1: Single frame clean and eye-visible on both eyes
     if best_both is not None:
         rgb = _load_rgb(best_both)
-        _save_png_atomic(rgb, ref_out)
         st = idx_to_stat[best_both]
-        return _save_meta(
+        return _publish_ref(
+            rgb,
             ReferenceResult(
                 mode="auto",
                 strategy="single_clean_frame",
@@ -603,10 +746,9 @@ def build_clean_reference(
                 left_glare_pct=float(st["glare_left_pct"]),
                 right_glare_pct=float(st["glare_right_pct"]),
                 details=f"Selected verified clean frame {best_both} for both eyes.",
-            )
+            ),
         )
 
-    # Case 2: Both eyes clean on different frames -> mask-constrained stitch + post-verification
     if best_l is not None and best_r is not None:
         rgb_l = _load_rgb(best_l)
         rgb_r = _load_rgb(best_r)
@@ -615,7 +757,7 @@ def build_clean_reference(
         glare_l = _load_gray(glare_masks_dir, best_l)
         glare_r = _load_gray(glare_masks_dir, best_r)
         bridge_x = _estimate_bridge_x(config.roi_size, roi_meta=roi_meta, lens_mask=full_l)
-        stitched = stitch_left_right_roi(
+        stitched, carried = _stitch_with_glare_tracking(
             rgb_l,
             rgb_r,
             bridge_x=bridge_x,
@@ -625,11 +767,11 @@ def build_clean_reference(
             right_lens_mask=rm_r,
         )
         ok_syn, gl_syn, gr_syn = _verify_synthesized_reference(
-            stitched, lm_l, rm_r, config.max_clean_glare_pct
+            stitched, lm_l, rm_r, config.max_clean_glare_pct, carried_glare=carried
         )
         if ok_syn:
-            _save_png_atomic(stitched, ref_out)
-            return _save_meta(
+            return _publish_ref(
+                stitched,
                 ReferenceResult(
                     mode="auto",
                     strategy="stitched_left_right",
@@ -642,15 +784,14 @@ def build_clean_reference(
                     details=(
                         f"Stitched verified left eye (frame {best_l}) and right eye (frame {best_r})."
                     ),
-                )
+                ),
             )
         logger.warning(
-            "Stitched reference failed clean verification (L=%.1f%%, R=%.1f%%); falling back.",
+            "Stitched reference failed glare-free verification (L=%.1f%%, R=%.1f%%); falling back.",
             gl_syn,
             gr_syn,
         )
 
-    # Case 3: Single clean eye -> glare-masked mirror across bridge + post-verification
     if config.allow_mirror and (best_l is not None or best_r is not None):
         clean_side = "left" if best_l is not None else "right"
         src_idx = best_l if best_l is not None else best_r
@@ -661,7 +802,7 @@ def build_clean_reference(
         glare_m = _load_gray(glare_masks_dir, src_idx)
         bridge_x = _estimate_bridge_x(config.roi_size, roi_meta=roi_meta, lens_mask=full_m)
 
-        mirrored = mirror_clean_eye_across_bridge(
+        mirrored, carried = _mirror_with_glare_tracking(
             rgb,
             clean_side=clean_side,
             bridge_x=bridge_x,
@@ -673,11 +814,11 @@ def build_clean_reference(
         syn_r = mir_lens if clean_side == "left" else clean_lens
 
         ok_syn, gl_syn, gr_syn = _verify_synthesized_reference(
-            mirrored, syn_l, syn_r, config.max_clean_glare_pct
+            mirrored, syn_l, syn_r, config.max_clean_glare_pct, carried_glare=carried
         )
         if ok_syn:
-            _save_png_atomic(mirrored, ref_out)
-            return _save_meta(
+            return _publish_ref(
+                mirrored,
                 ReferenceResult(
                     mode="auto",
                     strategy=f"mirrored_{clean_side}",
@@ -691,18 +832,16 @@ def build_clean_reference(
                         f"Mirrored verified clean {clean_side} eye (frame {src_idx}) "
                         f"across bridge x={bridge_x:.1f}."
                     ),
-                )
+                ),
             )
         logger.warning(
-            "Mirrored reference failed clean verification (L=%.1f%%, R=%.1f%%); falling back.",
+            "Mirrored reference failed glare-free verification (L=%.1f%%, R=%.1f%%); falling back.",
             gl_syn,
             gr_syn,
         )
 
-    # Case 4: Graceful reference-free fallback (never feed glared/washed-out reference)
-    if ref_out.exists():
-        ref_out.unlink()
-    return _save_meta(
+    return _publish_ref(
+        None,
         ReferenceResult(
             mode="auto",
             strategy="reference_free_fallback",
@@ -712,5 +851,5 @@ def build_clean_reference(
                 f"max_clean_glare_pct={config.max_clean_glare_pct}%; "
                 "falling back to reference-free VACE."
             ),
-        )
+        ),
     )

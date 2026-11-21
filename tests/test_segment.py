@@ -343,3 +343,189 @@ def test_bidirectional_seed_frame_and_oom_halving_and_cpu_session_kwargs(tmp_pat
     assert kw["inference_state_device"] == "cpu"
     assert kw["video_storage_device"] == "cpu"
     assert kw["max_vision_features_cache_size"] == 1
+
+
+def test_segment_round3_p1_regressions_handoff_smoothing_oom_and_npz_loads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regressions P1-1, P1-7, P1-8, P1-9, P1-10."""
+    from eyeglass_glare_removal import segment
+    from eyeglass_glare_removal.config import SegmentConfig
+
+    # --- P1-1: handoff_iou_threshold & device must alter segment generation ---
+    il, ir = build_initial_lens_prompts(None, roi_size=64)
+    g1 = segment.compute_segment_generation("dig", 0, il, ir, SegmentConfig(handoff_iou_threshold=0.5))
+    g2 = segment.compute_segment_generation("dig", 0, il, ir, SegmentConfig(handoff_iou_threshold=0.7))
+    g3 = segment.compute_segment_generation("dig", 0, il, ir, SegmentConfig(device="cpu"))
+    assert g1[0] != g2[0] and g1[1] != g2[1]
+    assert g1[0] != g3[0] and g1[1] != g3[1]
+
+    H = W = 64
+    bl = np.zeros((H, W), dtype=bool)
+    br = np.zeros((H, W), dtype=bool)
+    bl[20:44, 8:26] = True
+    br[20:44, 38:56] = True
+
+    # --- P1-7: overlap=1 rejected for multi-chunk; matched mutual occlusion passes without abort ---
+    with pytest.raises(ValueError, match="overlap=1 cannot verify"):
+        run_chunked_tracking_loop(
+            lambda frames, **_kw: ([bl.copy() for _ in frames], [br.copy() for _ in frames]),
+            lambda i: i,
+            n_frames=16,
+            init_left_prompts=il,
+            init_right_prompts=ir,
+            chunk_size=10,
+            overlap=1,
+        )
+
+    empty_b = np.zeros((H, W), dtype=bool)
+
+    def occluded_overlap_runner(frames, **_kw):
+        # Frames 6..10 have right eye occluded (empty); reappears on frame 11+!
+        ls, rs = [], []
+        for fi in frames:
+            ls.append(bl.copy())
+            rs.append(empty_b.copy() if 6 <= fi <= 10 else br.copy())
+        return ls, rs
+
+    l_occ, r_occ, logs_occ = run_chunked_tracking_loop(
+        occluded_overlap_runner,
+        lambda i: i,
+        n_frames=16,
+        init_left_prompts=il,
+        init_right_prompts=ir,
+        chunk_size=10,
+        overlap=3,
+    )
+    assert len(l_occ) == 16 and len(r_occ) == 16 and len(logs_occ) == 2
+    assert mask_iou(r_occ[-1], br) == pytest.approx(1.0)
+
+    # --- P1-1 & P1-10: predecessor overlap change invalidates chunk 1; .npz loads each array ONCE ---
+    ckpt_dir = tmp_path / "npz_ckpts"
+    calls = 0
+
+    def steady_runner(frames, **_kw):
+        nonlocal calls
+        calls += 1
+        return [bl.copy() for _ in frames], [br.copy() for _ in frames]
+
+    run_chunked_tracking_loop(
+        steady_runner,
+        lambda i: i,
+        n_frames=16,
+        init_left_prompts=il,
+        init_right_prompts=ir,
+        chunk_size=10,
+        overlap=3,
+        ckpt_dir=ckpt_dir,
+        fingerprint="fp_npz",
+    )
+    assert calls == 2
+
+    # Resume with counting np.load wrapper: each array key read EXACTLY ONCE per chunk (not per frame!)
+    real_np_load = np.load
+    key_reads: list[str] = []
+
+    class CountingNpz:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return self._inner.__exit__(*a)
+
+        def __contains__(self, k):
+            return k in self._inner
+
+        def __getitem__(self, k):
+            if k in ("left", "right"):
+                key_reads.append(k)
+            return self._inner[k]
+
+    monkeypatch.setattr(segment.np, "load", lambda *a, **kw: CountingNpz(real_np_load(*a, **kw)))
+    run_chunked_tracking_loop(
+        steady_runner,
+        lambda i: i,
+        n_frames=16,
+        init_left_prompts=il,
+        init_right_prompts=ir,
+        chunk_size=10,
+        overlap=3,
+        ckpt_dir=ckpt_dir,
+        fingerprint="fp_npz",
+    )
+    monkeypatch.setattr(segment.np, "load", real_np_load)
+    assert calls == 2  # resumed both chunks cleanly
+    assert key_reads.count("left") == 2 and key_reads.count("right") == 2  # 1 read per chunk, NOT 16!
+
+    # Now mutate chunk 0's overlap mask on disk -> chunk 1 checkpoint MUST invalidate & re-run!
+    bl_shifted = np.zeros((H, W), dtype=bool)
+    bl_shifted[16:40, 12:30] = True
+    c0_path = sorted(ckpt_dir.glob("chunk_0000_*.npz"))[0]
+    with real_np_load(c0_path, allow_pickle=False) as d0:
+        r0 = np.array(d0["right"])
+        fp0 = str(d0["fingerprint"].item())
+    np.savez_compressed(
+        c0_path,
+        left=np.stack([bl_shifted] * 10, axis=0),
+        right=r0,
+        fingerprint=fp0,
+    )
+
+    def shifted_runner(frames, **_kw):
+        nonlocal calls
+        calls += 1
+        return [bl_shifted.copy() for _ in frames], [br.copy() for _ in frames]
+
+    run_chunked_tracking_loop(
+        shifted_runner,
+        lambda i: i,
+        n_frames=16,
+        init_left_prompts=il,
+        init_right_prompts=ir,
+        chunk_size=10,
+        overlap=3,
+        ckpt_dir=ckpt_dir,
+        fingerprint="fp_npz",
+    )
+    assert calls == 3  # chunk 1 recomputed because predecessor overlap digest changed!
+
+    # --- P1-8: moving 100px mask + empty dropout keeps valid frame at 100px; full outlier keeps 256px ---
+    m0 = np.zeros((64, 64), dtype=np.uint8)
+    m0[20:30, 10:20] = 255  # 100px
+    m1 = np.zeros((64, 64), dtype=np.uint8)
+    m1[20:30, 22:32] = 255  # shifted 12px (IoU=0 with m0)
+    m_empty = np.zeros((64, 64), dtype=np.uint8)
+    m3 = np.zeros((64, 64), dtype=np.uint8)
+    m3[20:30, 34:44] = 255
+    out_motion = temporal_smooth_binary_masks([m0, m1, m_empty, m3], radius=1)
+    assert int((out_motion[1] > 127).sum()) == 100  # valid frame NEVER erased by dropout + motion!
+
+    stat = np.zeros((64, 64), dtype=np.uint8)
+    stat[24:40, 24:40] = 255  # 256px
+    full_out = np.full((64, 64), 255, dtype=np.uint8)
+    out_spike = temporal_smooth_binary_masks([stat, full_out, stat], radius=1)
+    assert [int((m > 127).sum()) for m in out_spike] == [256, 256, 256]
+
+    # --- P1-9: OOM retry with chunk_size=16, overlap=10 shrinks BOTH chunk_size AND overlap ---
+    seen_oom_lens: list[int] = []
+
+    def tight_vram_runner(frames, **_kw):
+        seen_oom_lens.append(len(frames))
+        if len(frames) > 10:
+            raise RuntimeError("CUDA out of memory")
+        return [bl.copy() for _ in frames], [br.copy() for _ in frames]
+
+    l_tight, _, _ = run_chunked_tracking_loop(
+        tight_vram_runner,
+        lambda i: i,
+        n_frames=24,
+        init_left_prompts=il,
+        init_right_prompts=ir,
+        chunk_size=16,
+        overlap=10,
+    )
+    assert len(l_tight) == 24
+    assert any(L <= 10 for L in seen_oom_lens)
