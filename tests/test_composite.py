@@ -416,6 +416,7 @@ def test_composite_round3_p0_p1_regressions_bridge_wide_rim_relative_src_save_fr
 
     real_src = tmp_path / "real_source.mp4"
     real_src.write_bytes(b"SRC")
+    rel_meta["source_sha256"] = composite.hash_file_sha256(real_src)
     with pytest.raises(ValueError, match="Symlinked"):
         composite.run_composite_stage(
             orig_frames_dir=orig_dir,
@@ -458,3 +459,124 @@ def test_composite_round3_p0_p1_regressions_bridge_wide_rim_relative_src_save_fr
         )
     assert out_mp4.read_bytes() == b"OLD_MAIN"
     assert cmp_mp4.read_bytes() == b"OLD_COMPARE"
+
+
+@pytest.mark.parametrize("failure", ["compare_encode", "second_png_install", None])
+def test_export_pngs_and_videos_publish_together(tmp_path: Path, monkeypatch, failure) -> None:
+    import os
+
+    work = tmp_path / "work"
+    frames, cleaned, masks, exports = (work / p for p in ("frames", "cleaned", "masks", "exports"))
+    for directory in (frames, cleaned, masks, exports):
+        directory.mkdir(parents=True)
+    records = []
+    for i in range(2):
+        fn = f"{i:06d}.png"
+        Image.new("RGB", (32, 32), (50 + i, 55, 60)).save(frames / fn)
+        records.append({"frame_idx": i, "filename": fn, "x1": 0, "y1": 0, "x2": 32, "y2": 32})
+    previous = {
+        exports / "000000.png": b"old PNG", exports / "keep.txt": b"unrelated",
+        tmp_path / "out.mp4": b"old main", tmp_path / "out_compare.mp4": b"old compare",
+    }
+    for path, content in previous.items():
+        path.write_bytes(content)
+    out = tmp_path / "out.mp4"
+
+    class Pipe:
+        def __init__(self, output):
+            self.output = output
+            self.stdin = io.BytesIO()
+
+        def poll(self):
+            return 0
+
+    def close(pipe, label):
+        assert (exports / "000000.png").read_bytes() == b"old PNG"
+        assert not (exports / "000001.png").exists()
+        if label == "compare" and failure == "compare_encode":
+            raise RuntimeError("compare encode failed")
+        pipe.output.write_bytes(b"new " + label.encode())
+
+    monkeypatch.setattr(composite, "open_video_writer_pipe", lambda *a, **_k: Pipe(a[3]))
+    monkeypatch.setattr(composite, "close_video_writer_pipe", close)
+    real_replace = os.replace
+
+    def replace(src, dst, **kwargs):
+        real_replace(src, dst, **kwargs)
+        if failure == "second_png_install" and dst == "000001.png":
+            raise RuntimeError("second PNG install failed")
+
+    monkeypatch.setattr(os, "replace", replace)
+
+    def render():
+        return composite.run_composite_stage(
+            orig_frames_dir=frames, cleaned_roi_dir=cleaned, lens_masks_dir=masks,
+            roi_meta={"fps": 24, "full_width": 32, "full_height": 32, "frames": records},
+            output_mp4=out, config=CompositeConfig(compare=True, save_frames_dir=exports, workers=2),
+            frame_has_edit=[False, False], workspace_root=work,
+        )
+
+    if failure is None:
+        render()
+        assert out.read_bytes() == b"new main"
+        assert (tmp_path / "out_compare.mp4").read_bytes() == b"new compare"
+        for record in records:
+            name = record["filename"]
+            assert (exports / name).read_bytes() == (frames / name).read_bytes()
+        assert (exports / "keep.txt").read_bytes() == b"unrelated"
+    else:
+        with pytest.raises(RuntimeError, match="failed"):
+            render()
+        assert {path: path.read_bytes() for path in previous} == previous
+        assert not (exports / "000001.png").exists()
+    assert not list(exports.glob(".*"))
+
+
+@pytest.mark.parametrize("stage", ["composite_expansion", "glare_dilation"])
+def test_lens_ownership_survives_two_pixel_expansion_and_stage2_dilation(stage: str) -> None:
+    from eyeglass_glare_removal.segment import clean_single_lens_mask, compute_glare_hotspot_mask
+
+    original = np.full((128, 128, 3), (130, 100, 80), dtype=np.uint8)
+    left = np.zeros(original.shape[:2], dtype=np.uint8)
+    right = left.copy()
+    left[35:94, 15:61] = 255
+    right[35:94, 63:109] = 255
+    exact = left | right
+    original[left > 0] = (250, 250, 250)
+    clean = np.full_like(original, 110)
+
+    def assert_clean_lens_unchanged(glare: np.ndarray, expansion: int) -> None:
+        result, support = composite.composite_single_frame(
+            original, clean, exact, glare, (0, 0, 128, 128), lens_expand_px=expansion,
+        )
+        assert np.any(result[left > 0] != original[left > 0])
+        assert np.array_equal(result[right > 0], original[right > 0])
+        assert not support[right > 0].any()
+
+    if stage == "composite_expansion":
+        assert_clean_lens_unchanged(left, 2)
+        return
+
+    left_interior = clean_single_lens_mask(left > 0, 5)
+    right_interior = clean_single_lens_mask(right > 0, 5)
+    detected = compute_glare_hotspot_mask(
+        original, left_interior | right_interior, dilate_px=14, feather_sigma=2.0,
+    )
+    assert detected[left_interior > 0].max() == 255
+    assert not detected[right > 0].any()
+    assert_clean_lens_unchanged(detected, 0)
+
+
+@pytest.mark.parametrize("bevel", [0, 4])
+def test_contour_protection_reaches_inner_half_of_metallic_rim_next_to_neutral_glare(bevel) -> None:
+    yy, xx = np.ogrid[:128, :128]
+    radius = np.hypot(xx - 64, yy - 64)
+    lens = (radius <= 30).astype(np.uint8) * 255
+    rim = (radius > 27) & (radius <= 33)
+    original = np.full((128, 128, 3), (150, 118, 96), dtype=np.uint8)
+    original[radius <= 27] = 240
+    original[rim] = 232
+    clean = np.full_like(original, 110)
+    alpha, _ = composite.compute_rim_safe_alpha(original, clean, lens, lens, bevel_band_px=bevel)
+    assert float(np.median(alpha[rim & (lens > 0)])) < 0.15
+    assert float(np.median(alpha[radius < 26])) > 0.95

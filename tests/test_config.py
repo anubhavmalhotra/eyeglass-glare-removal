@@ -159,3 +159,23 @@ def test_canonical_apache2_license_integrity() -> None:
     assert "Version 2.0, January 2004" in lic
     assert lic.count('"Contributor" shall mean Licensor') == 1
     assert '"Source" form shall mean the preferred form' in lic
+
+
+@pytest.mark.parametrize("stage", ["prep", "masks", "reference", "inpaint"])
+def test_pipeline_protects_published_destinations_inside_replaceable_stages(
+    tmp_path: Path, stage: str,
+) -> None:
+    work = tmp_path / "work"
+    stage_dir = work / stage
+    stage_dir.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(stage_dir, target_is_directory=True)
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "output.mp4"
+    with pytest.raises(ValueError, match="replaceable stage"):
+        PipelineConfig(input_path=source, work_dir=work, output_path=alias / "output.mp4")
+    with pytest.raises(ValueError, match="replaceable stage"):
+        PipelineConfig(
+            input_path=source, work_dir=work, output_path=output,
+            composite=CompositeConfig(save_frames_dir=stage_dir / "frames"),
+        )

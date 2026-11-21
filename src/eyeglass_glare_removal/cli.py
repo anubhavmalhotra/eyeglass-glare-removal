@@ -510,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
                     for fn in filenames
                 ]
                 ref_paths: list[Path] | None = None
+                workspace_reference = False
                 if not args.no_ref:
                     if args.ref_image is not None:
                         ref_paths = [args.ref_image]
@@ -517,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
                         verified_ref = verify_reference_artifact(layout, roi_meta, mask_stats)
                         if verified_ref is not None:
                             ref_paths = [verified_ref]
+                            workspace_reference = True
                 inp_size = (
                     args.size
                     if args.size is not None
@@ -554,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
                     segment_generation=mask_stats.get("segment_generation"),
                     roi_frames_digest=live_roi_digest,
                     masks_digest=live_masks_digest,
+                    workspace_reference=workspace_reference,
                 )
                 print(json.dumps(res, indent=2))
                 return 0
@@ -597,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
                     audio_path=audio_p,
                     source_video_path=args.source,
                     frame_has_edit=frame_has_edit,
+                    workspace_root=layout.root,
                 )
                 print(json.dumps(res, indent=2))
                 return 0

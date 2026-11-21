@@ -48,6 +48,8 @@ class ReferenceResult:
     prep_generation: str | None = None
     segment_generation: str | None = None
     ref_sha256: str | None = None
+    roi_frames_digest: str | None = None
+    masks_digest: str | None = None
     details: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,20 +143,10 @@ def verify_eye_visibility(
     roi_rgb: np.ndarray,
     eye_mask: np.ndarray,
     full_lens_mask: np.ndarray | None = None,
+    *,
+    eye_center: tuple[float, float] | None = None,
 ) -> tuple[bool, dict[str, float]]:
-    """
-    Require positive, spatially localized eye-visibility evidence inside the central
-    iris/eyelid region of `eye_mask` before accepting a candidate as a clean reference.
-
-    Rejects both washed-out uniform glare sheets AND non-eye periodic/striped reflections
-    spanning the lens:
-      1) Central eye zone dynamic range (`p90 - p10 >= 18.0`) & non-washout median luminance.
-      2) Localized compact dark iris/pupil cluster centered inside the central eye zone
-         (bounded width/height & aspect ratio, NOT edge-to-edge stripes).
-      3) Non-stripe / non-reflection periphery check: rejects periodic stripe patterns where
-         the outer lens periphery mirrors the same high contrast / dark-bright alternation as
-         the central eye zone.
-    """
+    """Require a compact pupil, corroborating lid edges, and agreement with available landmarks."""
     region = eye_mask > 127
     lens_area = int(region.sum())
     if lens_area < 40:
@@ -207,11 +199,12 @@ def verify_eye_visibility(
     # cannot impersonate a compact central iris blob!
     dark_thresh = min(115.0, skin_L + 5.0, p75_c - 15.0)
     dark_mask = (L <= dark_thresh) & region
-    n_dc, _, d_stats, d_centroids = cv2.connectedComponentsWithStats(
+    n_dc, d_labels, d_stats, d_centroids = cv2.connectedComponentsWithStats(
         dark_mask.astype(np.uint8), connectivity=8
     )
 
     compact_central_iris = False
+    corroborating_eyelids = False
     spanning_stripes = 0
     for cid in range(1, n_dc):
         area = int(d_stats[cid, cv2.CC_STAT_AREA])
@@ -232,9 +225,37 @@ def verify_eye_visibility(
             and 10 <= area <= int(0.42 * lens_area)
             and cw <= 0.65 * bw
             and ch <= 0.72 * bh
-            and 0.35 <= aspect <= 2.8
+            and 0.45 <= aspect <= 2.2
+            and area >= 0.48 * cw * ch
+            and (eye_center is None or (
+                abs(ccx - eye_center[0]) <= 0.24 * bw and abs(ccy - eye_center[1]) <= 0.24 * bh
+            ))
         ):
             compact_central_iris = True
+            px, py = int(round(ccx)), int(round(ccy))
+            if d_labels[py, px] != cid:
+                continue
+            # The pupil must sit between two parts of the same eye opening. Look
+            # for a bright lateral interior bounded above and below by lid edges.
+            inner_x = max(1, int(np.ceil(cw / 2)))
+            outer_x = min(int(round(0.28 * bw)), inner_x + max(2, int(0.15 * bw)))
+            yr = max(2, int(round(0.25 * bh)))
+            if outer_x <= inner_x or not (yr <= py < H - yr and outer_x <= px < W - outer_x):
+                continue
+            paired = []
+            for x_slice in (slice(px - outer_x, px - inner_x + 1), slice(px + inner_x, px + outer_x + 1)):
+                profile = np.median(L[py - yr : py + yr + 1, x_slice], axis=1)
+                upper = np.diff(profile[:yr + 1])
+                lower = -np.diff(profile[yr:])
+                lid_top = int(np.argmax(upper)) + 1
+                lid_bottom = int(np.argmax(lower))
+                paired.append(
+                    upper.max() >= 9.0 and lower.max() >= 9.0
+                    and profile[yr] >= L[py, px] + 18.0
+                    and yr - lid_top >= 1 and lid_bottom >= 1
+                    and bool(region[py, x_slice].all())
+                )
+            corroborating_eyelids |= all(paired)
 
     # Reject periodic/striped full-lens reflection patterns:
     # 1) Multiple dark bands spanning across the full lens width/height, OR
@@ -252,7 +273,7 @@ def verify_eye_visibility(
         ):
             periph_non_eye = True
 
-    is_localized_eye = compact_central_iris and (spanning_stripes == 0) and (not periph_non_eye)
+    is_localized_eye = corroborating_eyelids and (spanning_stripes == 0) and (not periph_non_eye)
 
     metrics = {
         "skin_L": round(skin_L, 2),
@@ -262,6 +283,7 @@ def verify_eye_visibility(
         "dyn_range": round(dyn_range, 2),
         "grad_p75": round(grad_p75, 2),
         "compact_iris": float(compact_central_iris),
+        "corroborating_eyelids": float(corroborating_eyelids),
         "spanning_stripes": float(spanning_stripes),
         "periph_non_eye": float(periph_non_eye),
     }
@@ -345,13 +367,15 @@ def _stitch_with_glare_tracking(
     g_l = (left_glare_mask > 32) if left_glare_mask is not None else np.zeros((H, W), dtype=bool)
     g_r = (right_glare_mask > 32) if right_glare_mask is not None else np.zeros((H, W), dtype=bool)
 
-    # Whenever left is glared and right is clean -> strictly take right (1.0);
-    # whenever right is glared and left is clean -> strictly take left (0.0).
-    w_right_2d = np.where(g_l & (~g_r), 1.0, w_right_2d)
-    w_right_2d = np.where(g_r & (~g_l), 0.0, w_right_2d)
+    # Switch to a clean source at the seam. Required lenses retain their source so
+    # the caller can reject contamination there.
+    left_required = left_lens_mask > 127 if left_lens_mask is not None else False
+    right_required = right_lens_mask > 127 if right_lens_mask is not None else False
+    w_right_2d = np.where(g_l & ~g_r & np.logical_not(left_required), 1.0, w_right_2d)
+    w_right_2d = np.where(g_r & ~g_l & np.logical_not(right_required), 0.0, w_right_2d)
 
     w_right_2d = np.clip(w_right_2d, 0.0, 1.0)
-    carried_glare = ((w_right_2d < 0.99) & g_l) | ((w_right_2d > 0.01) & g_r)
+    carried_glare = ((w_right_2d < 1.0) & g_l) | ((w_right_2d > 0.0) & g_r)
 
     w_right = w_right_2d[:, :, None]
     blended = left_rgb.astype(np.float32) * (1.0 - w_right) + right_rgb.astype(np.float32) * w_right
@@ -407,7 +431,10 @@ def _mirror_with_glare_tracking(
 
     mirrored = _mirror_array_across_x(rgb, bridge_x, cv2.INTER_LINEAR)
     mir_glare = (
-        _mirror_array_across_x(glare_mask, bridge_x, cv2.INTER_NEAREST)
+        (
+            _mirror_array_across_x((glare_mask > 32).astype(np.float32), bridge_x, cv2.INTER_LINEAR)
+            > 0
+        ).astype(np.uint8) * 255
         if glare_mask is not None
         else None
     )
@@ -620,6 +647,8 @@ def build_clean_reference(
                 res.ref_sha256 = None
             res.prep_generation = prep_gen
             res.segment_generation = seg_gen
+            res.roi_frames_digest = roi_meta.get("roi_frames_digest") if roi_meta else None
+            res.masks_digest = mask_stats.get("masks_digest") if mask_stats else None
             atomic_write_text(stage_dir / "reference_meta.json", json.dumps(res.to_dict(), indent=2))
             atomic_swap_directory(stage_dir, out_dir)
             return res
@@ -720,7 +749,13 @@ def build_clean_reference(
             rgb = _cached_rgb(idx)
             lm, rm, full_m = _get_eye_masks(idx)
             eye_m = lm if side == "left" else rm
-            ok, _ = verify_eye_visibility(rgb, eye_m, full_lens_mask=full_m)
+            center = None
+            if idx == roi_meta.get("init_frame_idx"):
+                geometry = roi_meta.get("init_eye_geometry_roi") or {}
+                landmark = geometry.get(f"{side}_eye")
+                if landmark is not None:
+                    center = (float(landmark[0]), float(landmark[1]))
+            ok, _ = verify_eye_visibility(rgb, eye_m, full_lens_mask=full_m, eye_center=center)
             vis_cache[key] = ok
         return vis_cache[key]
 

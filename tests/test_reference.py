@@ -137,6 +137,8 @@ def test_reference_auto_both_clean_single_frame(tmp_path: Path) -> None:
         lens_areas=[(1000, 1000), (200, 200), (1020, 990)],
     )
     cfg = ReferenceConfig(mode="auto", max_clean_glare_pct=3.0, roi_size=128)
+    roi_meta["roi_frames_digest"] = "roi-digest"
+    mask_stats["masks_digest"] = "mask-digest"
     res = build_clean_reference(
         config=cfg,
         out_dir=tmp_path / "ref",
@@ -150,6 +152,8 @@ def test_reference_auto_both_clean_single_frame(tmp_path: Path) -> None:
     assert res.ref_path is not None and res.ref_path.exists()
     assert res.left_frame_idx == 2
     assert res.right_frame_idx == 2
+    assert res.roi_frames_digest == "roi-digest"
+    assert res.masks_digest == "mask-digest"
 
 
 def test_reference_rejects_washed_out_rgb175_over_dark_skin_detector_to_reference(
@@ -401,3 +405,62 @@ def test_reference_stitch_rejects_known_glare_pixels_inside_required_lens(tmp_pa
     # Neither stitch nor mirror may keep those 9 known glare pixels -> must fall back to None!
     assert res.ref_path is None
     assert res.strategy == "reference_free_fallback"
+
+
+def test_fractional_mirror_reports_known_glare_in_bilinear_footprint() -> None:
+    from eyeglass_glare_removal.reference import _mirror_with_glare_tracking
+
+    rgb = np.full((24, 32, 3), 50, dtype=np.uint8)
+    glare = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    lens = np.zeros_like(glare)
+    lens[5:20, 4:13] = 255
+    rgb[10, 10] = 250
+    glare[10, 10] = 255
+    # Right x=22 samples source x=10.75. Nearest neighbor sees only x=11.
+    mirrored, carried = _mirror_with_glare_tracking(
+        rgb, "left", 16.375, glare_mask=glare, clean_lens_mask=lens,
+    )
+    assert mirrored[10, 22].tolist() == [100, 100, 100]
+    assert carried[10, 22]
+    assert not carried[10, 24]
+
+
+def test_localized_crossed_stripes_without_eyelids_cannot_seed_reference(tmp_path: Path) -> None:
+    rgb = np.full((128, 128, 3), (90, 62, 46), dtype=np.uint8)
+    left = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    right = left.copy()
+    yy, xx = np.mgrid[:128, :128]
+    for center_x, lens in ((36, left), (92, right)):
+        cv2.ellipse(lens, (center_x, 64), (22, 15), 0, 0, 360, 255, -1)
+        x, y = xx - center_x, yy - 64
+        patch = (abs(x) <= 10) & (abs(y) <= 6)
+        stripes = ((x + y) % 3 == 0) | ((x - y) % 3 == 0)
+        rgb[patch & stripes] = (39, 38, 37)
+        rgb[patch & ~stripes] = (116, 112, 108)
+
+    lenses = left | right
+    glare = compute_glare_hotspot_mask(rgb, lenses, dilate_px=2, feather_sigma=1.0)
+    assert not glare.any()
+    for lens in (left, right):
+        visible, metrics = verify_eye_visibility(rgb, lens, lenses)
+        assert metrics["compact_iris"] == 1.0
+        assert not visible
+
+    roi, masks = tmp_path / "roi", tmp_path / "masks"
+    roi.mkdir()
+    masks.mkdir()
+    Image.fromarray(rgb).save(roi / "000000.png")
+    Image.fromarray(lenses).save(masks / "000000.png")
+    result = build_clean_reference(
+        config=ReferenceConfig(mode="auto", roi_size=128), out_dir=tmp_path / "reference",
+        roi_dir=roi, lens_masks_dir=masks, roi_meta={
+            "frames": [{"filename": "000000.png", "frame_idx": 0}],
+        },
+        mask_stats={"frames": [{
+            "frame_idx": 0, "left_lens_roi_px": int((left > 0).sum()),
+            "right_lens_roi_px": int((right > 0).sum()),
+            "glare_left_pct": 0.0, "glare_right_pct": 0.0,
+        }]},
+    )
+    assert result.strategy == "reference_free_fallback"
+    assert result.ref_path is None

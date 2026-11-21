@@ -396,3 +396,34 @@ def test_inpaint_round3_p1_regressions_fingerprint_bnb_cache_key_standalone_umt5
     assert called_standalone == {"tokenizer": "google/umt5-xxl", "encoder": "google/umt5-xxl"}
     assert pipe.kwargs["tokenizer"] == "TOK"
     assert pipe.kwargs["text_encoder"] == "ENC"
+
+
+@pytest.mark.parametrize("interrupted_rename", ["backup", "install"])
+def test_inpaint_commit_restores_prior_generation_when_rename_applies_before_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted_rename: str,
+) -> None:
+    import os
+
+    frames, masks, _ = _write_synthetic_inpaint_inputs(tmp_path, n_frames=2, glare_frames=set())
+    work = tmp_path / "inpaint"
+    config = InpaintConfig(size=64)
+    run_inpaint_chunks(frames, masks, work, config)
+    target = work / "roi_cleaned"
+    published = [*(target / path.name for path in frames), work / "edit_support.json", work / "inpaint_summary.json"]
+    prior_bytes = {path: path.read_bytes() for path in published}
+    Image.new("RGB", (64, 64), (110, 115, 120)).save(frames[0])
+
+    real_replace = os.replace
+
+    def interrupted_replace(src, dst):
+        real_replace(src, dst)
+        if interrupted_rename == "backup" and src == target and dst.name.startswith(".bak_"):
+            raise KeyboardInterrupt("after backup rename")
+        if interrupted_rename == "install" and dst == target and src.name.startswith(".stage_"):
+            raise KeyboardInterrupt("after installation rename")
+
+    monkeypatch.setattr(os, "replace", interrupted_replace)
+    with pytest.raises(KeyboardInterrupt, match="after"):
+        run_inpaint_chunks(frames, masks, work, config)
+    assert {path: path.read_bytes() for path in published} == prior_bytes
+    assert not list(work.glob(".bak_*"))

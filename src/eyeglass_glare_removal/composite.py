@@ -6,8 +6,10 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -16,13 +18,22 @@ from PIL import Image, ImageDraw
 from eyeglass_glare_removal._workspace import (
     assert_distinct_output_paths,
     assert_source_outside_managed_dir,
+    atomic_commit_paths,
     ensure_safe_child_file,
+    hash_file_sha256,
     make_unique_temp_sibling,
+    open_export_directory,
+    reject_symlink_components_under,
     reject_symlink_path,
     validate_safe_basename,
 )
 from eyeglass_glare_removal.config import CompositeConfig
-from eyeglass_glare_removal.media import close_video_writer_pipe, open_video_writer_pipe
+from eyeglass_glare_removal.media import (
+    close_video_writer_pipe,
+    open_video_writer_pipe,
+    probe_audio_has_packets,
+)
+from eyeglass_glare_removal.segment import expanded_lens_labels
 
 logger = logging.getLogger(__name__)
 
@@ -151,18 +162,12 @@ def compute_rim_safe_alpha(
     if glare_mask_roi is not None and int((glare_mask_roi > 0).sum()) == 0:
         return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=np.uint8)
 
-    base_bin = (lens_mask_roi > 127).astype(np.uint8)
-    if int(base_bin.sum()) == 0:
+    n_comp, comp_labels, owners = expanded_lens_labels(lens_mask_roi, lens_expand_px)
+    if n_comp == 1:
         return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=np.uint8)
+    original_bin = (comp_labels > 0).astype(np.uint8)
+    base_bin = (owners > 0).astype(np.uint8)
 
-    if lens_expand_px > 0:
-        ke = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * lens_expand_px + 1, 2 * lens_expand_px + 1)
-        )
-        base_bin = cv2.dilate(base_bin, ke, iterations=1)
-
-    # Identify active vs inactive lenses INDIVIDUALLY BEFORE any glare dilation so edit support
-    # can NEVER bleed across a narrow nose bridge into a clean opposite lens!
     inactive_lenses = np.zeros((H, W), dtype=bool)
     active_lens_union = np.zeros((H, W), dtype=np.uint8)
 
@@ -172,24 +177,26 @@ def compute_rim_safe_alpha(
         k_edit = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * edit_pad + 1, 2 * edit_pad + 1)
         )
-        n_comp, comp_labels = cv2.connectedComponents(base_bin, connectivity=8)
         active_base = np.zeros((H, W), dtype=np.uint8)
+        alpha_interior = np.zeros((H, W), dtype=np.float32)
 
-        for lbl in range(1, n_comp):
-            comp = comp_labels == lbl
-            comp_glare = comp & glare_pos
-            if int(comp_glare.sum()) == 0:
+        for label in range(1, n_comp):
+            comp = owners == label
+            comp_glare = (comp_labels == label) & glare_pos
+            if not comp_glare.any():
                 inactive_lenses |= comp
                 continue
             active_lens_union[comp] = 1
-            comp_support = cv2.dilate(comp_glare.astype(np.uint8), k_edit, iterations=1) > 0
-            active_base[comp & comp_support] = 1
+            comp_support = comp & (cv2.dilate(comp_glare.astype(np.uint8), k_edit) > 0)
+            active_base[comp_support] = 1
+            alpha_interior += inward_feather_alpha(
+                comp_support.astype(np.uint8) * 255, feather_px=max(feather_px, 2.0)
+            )
 
-        if int(active_base.sum()) == 0:
+        if not active_base.any():
             return np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=np.uint8)
-        alpha_interior = inward_feather_alpha(active_base * 255, feather_px=max(feather_px, 2.0))
     else:
-        active_lens_union = base_bin.copy()
+        active_lens_union = base_bin
         active_base = base_bin
         alpha_interior = inward_feather_alpha(active_base * 255, feather_px=feather_px)
 
@@ -252,6 +259,7 @@ def compute_rim_safe_alpha(
 
     ref_core = deep_core_all if int(deep_core_all.sum()) > 0 else (base_bin > 0)
     ys_in, xs_in = np.where(ref_core)
+    contour_rim = np.zeros_like(base_bin, dtype=bool)
     if ys_in.size > 0:
         _, nearest_lbl = cv2.distanceTransformWithLabels(
             (~ref_core).astype(np.uint8),
@@ -269,6 +277,26 @@ def compute_rim_safe_alpha(
         distinct_rim_prob = smoothstep((inner_diff - 7.0) / 8.0) * smoothstep(
             (grad_local - 14.0) / 16.0
         )
+
+        # Trace the outer contour into the lens while adjacent pixels retain its color.
+        # Measuring the connected span keeps the neighboring glare out of the rim mask.
+        k_contour = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        exterior = (original_bin == 0) & (cv2.dilate(original_bin, k_contour) > 0)
+        exterior_step = o_luma - cv2.erode(o_luma, k_contour)
+        outer_rim = exterior & (inner_diff >= 5.0) & (exterior_step >= 32.0)
+        if outer_rim.any():
+            rim_y, rim_x = np.where(outer_rim)
+            rim_distance, rim_labels = cv2.distanceTransformWithLabels(
+                (~outer_rim).astype(np.uint8), cv2.DIST_L2, 5,
+                labelType=cv2.DIST_LABEL_PIXEL,
+            )
+            nearest = np.clip(rim_labels - 1, 0, len(rim_y) - 1)
+            matches_rim = np.max(np.abs(o - o[rim_y[nearest], rim_x[nearest]]), axis=2) <= 5.0
+            candidates = matches_rim & (rim_distance <= 9.0)
+            contour_rim = outer_rim.copy()
+            k_adjacent = np.ones((3, 3), dtype=np.uint8)
+            for _ in range(8):
+                contour_rim |= (cv2.dilate(contour_rim.astype(np.uint8), k_adjacent) > 0) & candidates
     else:
         distinct_rim_prob = np.zeros_like(o_luma, dtype=np.float32)
 
@@ -294,6 +322,8 @@ def compute_rim_safe_alpha(
         0.0,
         1.0,
     )
+    rim_prob[contour_rim] = 1.0
+    inner_rim_zone |= contour_rim & (active_base > 0)
     w_rim_protect = np.clip(1.0 - float(rim_protect_strength) * rim_prob, 0.0, 1.0).astype(
         np.float32
     )
@@ -341,7 +371,7 @@ def compute_rim_safe_alpha(
         np.float32
     )
 
-    boundary_band = inner_rim_zone | bevel_ring
+    boundary_band = inner_rim_zone | bevel_ring | contour_rim
     alpha_guarded_interior = np.where(inner_rim_zone, alpha_interior * w_rim_protect, alpha_interior)
     alpha_combined = np.maximum(np.maximum(alpha_guarded_interior, inner_glare_boost), bevel_alpha)
     alpha_combined = np.where(boundary_band, np.minimum(alpha_combined, w_rim_protect), alpha_combined)
@@ -355,7 +385,7 @@ def compute_rim_safe_alpha(
     # Restore 1.0 strictly in deep core interior that is NOT rim-protected, THEN enforce final
     # rim exclusion on the entire boundary band so wide metallic rims can NEVER be forced to 1.0!
     alpha_roi = np.where(active_support > 0, np.clip(alpha_smooth, 0.0, 1.0), 0.0)
-    safe_core = deep_core & (rim_prob < 0.20) & (alpha_interior >= 0.99)
+    safe_core = deep_core & ~contour_rim & (rim_prob < 0.20) & (alpha_interior >= 0.99)
     alpha_roi = np.maximum(alpha_roi, np.where(safe_core, 1.0, 0.0))
     alpha_roi = np.where(boundary_band, np.minimum(alpha_roi, w_rim_protect), alpha_roi)
     alpha_roi = np.where(inactive_guard, 0.0, alpha_roi)
@@ -593,47 +623,6 @@ def build_compare_qa_grid(
         raise
 
 
-def _publish_files_atomically(pairs: list[tuple[Path, Path]]) -> None:
-    """
-    Publish one or more `(tmp_src, final_dest)` files with rollback protection on failure
-    or `BaseException` (preserving backup copies if rollback itself fails).
-    """
-    backups: list[tuple[Path, Path | None]] = []
-    committed = False
-    rollback_ok = True
-    try:
-        for tmp_src, dest in pairs:
-            backup: Path | None = None
-            if dest.exists():
-                backup = make_unique_temp_sibling(dest)
-                backup.unlink(missing_ok=True)
-                os.replace(dest, backup)
-            backups.append((dest, backup))
-            os.replace(tmp_src, dest)
-        committed = True
-    except BaseException:
-        for dest, backup in reversed(backups):
-            try:
-                if backup is not None and backup.exists():
-                    os.replace(backup, dest)
-                elif dest.exists():
-                    dest.unlink(missing_ok=True)
-            except OSError as rb_exc:
-                rollback_ok = False
-                logger.error(
-                    "Failed to roll back %s from backup %s (%s); preserving backup.",
-                    dest,
-                    backup,
-                    rb_exc,
-                )
-        raise
-    finally:
-        if committed or rollback_ok:
-            for _, backup in backups:
-                if backup is not None and backup.exists():
-                    backup.unlink(missing_ok=True)
-
-
 def run_composite_stage(
     *,
     orig_frames_dir: Path,
@@ -648,6 +637,7 @@ def run_composite_stage(
     qa_grid_path: Path | None = None,
     source_video_path: Path | None = None,
     frame_has_edit: list[bool] | None = None,
+    workspace_root: Path | None = None,
 ) -> dict[str, Any]:
     """Execute Stage 5 bounded-RAM streaming composite with atomic multi-file publish."""
     t0 = time.time()
@@ -702,45 +692,51 @@ def run_composite_stage(
             else output_mp4.with_name(f"{output_mp4.stem}_qa_grid.png")
         )
 
-    # Verify source identity safely (reject relative legacy source_video unless --source given!)
-    src_check = source_video_path
-    if src_check is None and roi_meta.get("source_video"):
-        raw_src = Path(str(roi_meta["source_video"]))
-        if not raw_src.is_absolute():
-            raise ValueError(
-                f"Manifest roi_boxes.json contains a relative source_video ({raw_src}) whose "
-                "identity cannot be verified from an arbitrary working directory; "
-                "pass --source <path> explicitly or rerun prep."
-            )
-        src_check = raw_src
+    recorded_source = Path(roi_meta["source_video"]) if roi_meta.get("source_video") else None
+    if recorded_source is not None and not recorded_source.is_absolute() and source_video_path is None:
+        raise ValueError("Manifest contains a relative source_video; pass --source or rerun prep.")
 
-    assert_distinct_output_paths(
-        src_check,
-        [
-            ("output", output_mp4),
-            ("compare", resolved_compare),
-            ("qa_grid", resolved_qa_grid),
-        ],
-    )
+    sources = [p for p in (recorded_source, source_video_path) if p is not None]
+    outputs = [("output", output_mp4), ("compare", resolved_compare), ("qa_grid", resolved_qa_grid)]
+    assert_distinct_output_paths(None, outputs)
+    for source in sources:
+        assert_distinct_output_paths(source, outputs)
+    if source_video_path is not None and (
+        not source_video_path.is_file()
+        or hash_file_sha256(source_video_path) != roi_meta.get("source_sha256")
+    ):
+        raise ValueError("Explicit --source does not match the prep source_sha256; rerun prep.")
 
-    resolved_audio: Path | None = None
-    if audio_path is not None and Path(audio_path).exists() and Path(audio_path).stat().st_size > 0:
-        resolved_audio = Path(audio_path)
+    resolved_audio = audio_path if audio_path is not None and probe_audio_has_packets(audio_path) else None
 
-    save_dir = Path(config.save_frames_dir) if config.save_frames_dir is not None else None
+    filenames = [validate_safe_basename(str(rec["filename"])) for rec in frame_records]
+    save_dir = config.save_frames_dir
+    export_pairs: dict[str, tuple[Path, Path]] = {}
     if save_dir is not None:
-        reject_symlink_path(save_dir, "save_frames_dir")
-        if src_check is not None:
-            assert_source_outside_managed_dir(src_check, save_dir)
+        save_anchor = (
+            workspace_root
+            if workspace_root is not None and save_dir.absolute().is_relative_to(workspace_root.absolute())
+            else None
+        )
+        if save_anchor is not None:
+            reject_symlink_components_under(save_anchor, save_dir)
+        else:
+            reject_symlink_path(save_dir, "save_frames_dir")
+        for source in sources:
+            assert_source_outside_managed_dir(source, save_dir)
         for in_dir in (orig_dir, clean_dir, masks_dir, glare_dir):
-            if in_dir is not None and save_dir.resolve(strict=False) == in_dir.resolve(strict=False):
+            if in_dir is not None and save_dir.resolve() == in_dir.resolve():
                 raise ValueError(
                     f"save_frames_dir ({save_dir}) must not collide with input stage directory ({in_dir})."
                 )
-        save_dir.mkdir(parents=True, exist_ok=True)
 
-    for rec in frame_records:
-        validate_safe_basename(str(rec["filename"]))
+        prefix = uuid4().hex
+        for fn in filenames:
+            dest = ensure_safe_child_file(save_dir, fn, allow_missing=True, workspace_root=save_anchor)
+            if dest.is_dir():
+                raise ValueError(f"Saved frame destination is a directory: {dest}")
+            assert_distinct_output_paths(dest, outputs)
+            export_pairs[fn] = (save_dir / f".frame_{prefix}_{fn}", dest)
 
     grid_indices: set[int] = set()
     if resolved_qa_grid is not None:
@@ -756,9 +752,9 @@ def run_composite_stage(
     src_color_range = vmeta.get("color_range")
     audio_offset_sec = float(roi_meta.get("audio_offset_sec", 0.0) or 0.0)
 
-    tmp_main = make_unique_temp_sibling(output_mp4)
-    tmp_cmp = make_unique_temp_sibling(resolved_compare) if resolved_compare is not None else None
-    tmp_qa: Path | None = None
+    tmp_main = tmp_cmp = tmp_qa = None
+    proc_main = proc_cmp = None
+    export_fd: int | None = None
 
     eff_bs = compute_effective_batch_size(
         full_w,
@@ -768,43 +764,6 @@ def run_composite_stage(
         max_batch_mem_mb=config.max_batch_mem_mb,
     )
     eff_workers = min(config.workers, eff_bs)
-
-    proc_main = open_video_writer_pipe(
-        full_w,
-        full_h,
-        fps,
-        tmp_main,
-        audio_path=resolved_audio,
-        audio_offset_sec=audio_offset_sec,
-        crf=config.crf,
-        preset=config.preset,
-        lossless=config.lossless,
-        num_frames=n_frames,
-        sample_aspect_ratio=src_sar,
-        color_primaries=src_primaries,
-        color_trc=src_trc,
-        colorspace=src_colorspace,
-        color_range=src_color_range,
-    )
-    proc_cmp = None
-    if tmp_cmp is not None:
-        cmp_w, cmp_h, _ = compute_compare_dimensions(full_w, full_h)
-        proc_cmp = open_video_writer_pipe(
-            cmp_w,
-            cmp_h,
-            fps,
-            tmp_cmp,
-            audio_path=resolved_audio,
-            audio_offset_sec=audio_offset_sec,
-            crf=config.crf,
-            preset=config.preset,
-            lossless=False,
-            num_frames=n_frames,
-            color_primaries=src_primaries,
-            color_trc=src_trc,
-            colorspace=src_colorspace,
-            color_range=src_color_range,
-        )
 
     orig_zooms: list[tuple[int, float, np.ndarray]] = []
     comp_zooms: list[tuple[int, float, np.ndarray]] = []
@@ -855,19 +814,11 @@ def run_composite_stage(
                 rim_protect_strength=config.rim_protect_strength,
             )
 
-        if save_dir is not None:
-            dst_frame = ensure_safe_child_file(save_dir, fn, allow_missing=True)
-            if src_check is not None:
-                assert_distinct_output_paths(src_check, [("saved_frame", dst_frame)])
-            tmp_frame = make_unique_temp_sibling(dst_frame)
-            try:
-                ok_w = cv2.imwrite(str(tmp_frame), cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2BGR))
-                if not ok_w:
-                    raise RuntimeError(f"Failed to write frame PNG: {dst_frame}")
-                os.replace(tmp_frame, dst_frame)
-            except BaseException:
-                tmp_frame.unlink(missing_ok=True)
-                raise
+        if export_fd is not None:
+            staged, _ = export_pairs[fn]
+            fd = os.open(staged.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=export_fd)
+            with os.fdopen(fd, "wb") as frame_file:
+                Image.fromarray(comp_rgb).save(frame_file, format="PNG")
 
         cmp_rgb = (
             build_compare_frame(orig_rgb, comp_rgb, box, i, fps) if proc_cmp is not None else None
@@ -890,7 +841,50 @@ def run_composite_stage(
 
         return i, comp_rgb, cmp_rgb, zoom_pair
 
+    resources = ExitStack()
     try:
+        if save_dir is not None:
+            export_fd = resources.enter_context(open_export_directory(save_dir, workspace_root))
+        tmp_main = make_unique_temp_sibling(output_mp4)
+        if resolved_compare is not None:
+            tmp_cmp = make_unique_temp_sibling(resolved_compare)
+        proc_main = open_video_writer_pipe(
+            full_w,
+            full_h,
+            fps,
+            tmp_main,
+            audio_path=resolved_audio,
+            audio_offset_sec=audio_offset_sec,
+            crf=config.crf,
+            preset=config.preset,
+            lossless=config.lossless,
+            num_frames=n_frames,
+            sample_aspect_ratio=src_sar,
+            color_primaries=src_primaries,
+            color_trc=src_trc,
+            colorspace=src_colorspace,
+            color_range=src_color_range,
+        )
+        proc_cmp = None
+        if tmp_cmp is not None:
+            cmp_w, cmp_h, _ = compute_compare_dimensions(full_w, full_h)
+            proc_cmp = open_video_writer_pipe(
+                cmp_w,
+                cmp_h,
+                fps,
+                tmp_cmp,
+                audio_path=resolved_audio,
+                audio_offset_sec=audio_offset_sec,
+                crf=config.crf,
+                preset=config.preset,
+                lossless=False,
+                num_frames=n_frames,
+                color_primaries=src_primaries,
+                color_trc=src_trc,
+                colorspace=src_colorspace,
+                color_range=src_color_range,
+            )
+
         with ThreadPoolExecutor(max_workers=eff_workers) as ex:
             for b_start in range(0, n_frames, eff_bs):
                 batch = frame_records[b_start : min(n_frames, b_start + eff_bs)]
@@ -917,7 +911,14 @@ def run_composite_stage(
             tmp_qa = make_unique_temp_sibling(resolved_qa_grid)
             build_compare_qa_grid(orig_zooms, comp_zooms, tmp_qa)
             publish_pairs.append((tmp_qa, resolved_qa_grid))
-        _publish_files_atomically(publish_pairs)
+        directory_fds = None
+        if save_dir is not None:
+            assert export_fd is not None
+            with open_export_directory(save_dir, workspace_root) as current_fd:
+                if not os.path.samestat(os.fstat(export_fd), os.fstat(current_fd)):
+                    raise ValueError("PNG export directory changed during rendering.")
+            directory_fds = {save_dir: export_fd}
+        atomic_commit_paths(publish_pairs + list(export_pairs.values()), directory_fds=directory_fds)
 
         return {
             "output_mp4": str(output_mp4),
@@ -934,9 +935,17 @@ def run_composite_stage(
             if p is not None and p.poll() is None:
                 p.kill()
                 p.wait()
-        tmp_main.unlink(missing_ok=True)
-        if tmp_cmp is not None:
-            tmp_cmp.unlink(missing_ok=True)
-        if tmp_qa is not None:
-            tmp_qa.unlink(missing_ok=True)
         raise
+    finally:
+        try:
+            for temp_path in (tmp_main, tmp_cmp, tmp_qa):
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
+            if export_fd is not None:
+                for staged, _ in export_pairs.values():
+                    try:
+                        os.unlink(staged.name, dir_fd=export_fd)
+                    except FileNotFoundError:
+                        pass
+        finally:
+            resources.close()

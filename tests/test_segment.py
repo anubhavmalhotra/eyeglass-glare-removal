@@ -529,3 +529,53 @@ def test_segment_round3_p1_regressions_handoff_smoothing_oom_and_npz_loads(
     )
     assert len(l_tight) == 24
     assert any(L <= 10 for L in seen_oom_lens)
+
+
+def test_handoff_rejects_swapped_lenses_on_first_visible_frame_after_empty_overlap() -> None:
+    left = np.zeros((64, 64), dtype=bool)
+    right = left.copy()
+    left[20:40, 7:24] = True
+    right[20:40, 40:57] = True
+    absent = np.zeros_like(left)
+    init_l, init_r = build_initial_lens_prompts(None, roi_size=64)
+
+    def run(swapped):
+        def tracker(frames, **_kwargs):
+            pair = (right, left) if swapped and frames[0] > 0 else (left, right)
+            return tuple([absent if 4 <= i <= 5 else mask for i in frames] for mask in pair)
+
+        return run_chunked_tracking_loop(
+            tracker, lambda i: i, 10, init_l, init_r, chunk_size=6, overlap=2,
+        )
+
+    with pytest.raises(RuntimeError, match="identity swap"):
+        run(swapped=True)
+    output_left, output_right, logs = run(swapped=False)
+    assert not output_left[5].any() and not output_right[5].any()
+    assert np.array_equal(output_left[6], left)
+    assert np.array_equal(output_right[6], right)
+    assert len(logs) == 2
+
+
+def test_oom_backoff_reaches_three_frame_sessions_with_two_frame_overlap() -> None:
+    left = np.zeros((64, 64), dtype=bool)
+    right = left.copy()
+    left[20:40, 7:24] = True
+    right[20:40, 40:57] = True
+    init_l, init_r = build_initial_lens_prompts(None, roi_size=64)
+    attempted = []
+
+    def runner(frames, **_kwargs):
+        attempted.append(len(frames))
+        if len(frames) > 3:
+            raise RuntimeError("CUDA out of memory")
+        return [left] * len(frames), [right] * len(frames)
+
+    l_out, r_out, logs = run_chunked_tracking_loop(
+        runner, lambda i: i, 21, init_l, init_r, chunk_size=16, overlap=2,
+    )
+    assert attempted[:4] == [16, 8, 4, 3]
+    assert len(l_out) == len(r_out) == 21
+    assert all(np.array_equal(mask, left) for mask in l_out)
+    assert all(np.array_equal(mask, right) for mask in r_out)
+    assert all(old["end"] - new["start"] == 2 for old, new in zip(logs, logs[1:], strict=False))

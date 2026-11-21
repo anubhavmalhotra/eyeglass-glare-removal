@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -149,8 +150,18 @@ def test_workspace_confinement_rejects_traversal_absolute_and_symlinks(tmp_path:
         ensure_safe_child_file(work / "frames", "000000.png", allow_missing=True)
 
 
+_CHUNK_RECORD = {
+    "chunk_idx": 0, "start": 0, "end": 1, "start_write": 0,
+    "from_checkpoint": False, "used_fallback": False,
+}
+_MASK_FRAME = {
+    "frame_idx": 0, "left_lens_roi_px": 0, "right_lens_roi_px": 0,
+    "glare_left_pct": 0.0, "glare_right_pct": 0.0,
+}
+
+
 def test_content_bound_resume_invalidates_on_replaced_video_or_corrupt_artifacts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression P0-2 & P1-10: replacing source clip at same path or corrupting PNGs invalidates resume."""
     inp = tmp_path / "video.mp4"
@@ -178,10 +189,13 @@ def test_content_bound_resume_invalidates_on_replaced_video_or_corrupt_artifacts
         "full_width": 160,
         "full_height": 120,
         "roi_size": 64,
+        "crop_size": 64,
+        "detector": "manual",
+        "fps": 30.0,
         "num_frames": 1,
         "init_frame_idx": 0,
         "init_eye_geometry_roi": None,
-        "frames": [{"frame_idx": 0, "filename": "000000.png"}],
+        "frames": [{"frame_idx": 0, "filename": "000000.png", "x1": 0, "y1": 0, "x2": 64, "y2": 64}],
     }
     layout.roi_boxes_json.write_text(json.dumps(roi_meta), encoding="utf-8")
 
@@ -221,7 +235,14 @@ def test_content_bound_resume_invalidates_on_replaced_video_or_corrupt_artifacts
 
     seg_cfg = SegmentConfig()
     il, ir = build_initial_lens_prompts(None, roi_size=64)
-    sam2_g, seg_g = compute_segment_generation(roi_d, 0, il, ir, seg_cfg)
+    import sys
+
+    from eyeglass_glare_removal import pipeline
+
+    runtime = ("cpu", "float32", "local:fixed", "test")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(__version__=runtime[-1]))
+    monkeypatch.setattr(pipeline, "resolve_segment_identity", lambda *_: runtime[:3])
+    sam2_g, seg_g = compute_segment_generation(roi_d, 0, il, ir, seg_cfg, runtime_identity=runtime)
     d_l = hash_files_manifest(layout.roi_lens_interior_dir, ["000000.png"])
     d_e = hash_files_manifest(layout.roi_lens_exact_dir, ["000000.png"])
     d_g = hash_files_manifest(layout.roi_glare_hotspot_dir, ["000000.png"])
@@ -236,10 +257,20 @@ def test_content_bound_resume_invalidates_on_replaced_video_or_corrupt_artifacts
                 "roi_frames_digest": roi_d,
                 "masks_digest": masks_d,
                 "num_frames": 1,
+                "chunks": [_CHUNK_RECORD],
+                "frames": [_MASK_FRAME],
             }
         ),
         encoding="utf-8",
     )
+    assert _segment_is_complete(layout, roi_meta, cfg_preview) is not None
+
+    # All artifact hashes and generations stay valid while consumed fields are corrupted.
+    valid_stats = layout.mask_stats_json.read_text()
+    for malformed in (None, [{"start": 0}], [{**_CHUNK_RECORD, "used_fallback": "false"}]):
+        layout.mask_stats_json.write_text(json.dumps({**json.loads(valid_stats), "chunks": malformed}))
+        assert _segment_is_complete(layout, roi_meta, cfg_preview) is None
+    layout.mask_stats_json.write_text(valid_stats)
     assert _segment_is_complete(layout, roi_meta, cfg_preview) is not None
 
     # Corrupting a mask PNG with garbage invalidates Stage 2 resume!
@@ -338,6 +369,7 @@ def test_round3_p0_p1_cli_generation_chain_symlink_ancestors_schema_and_atomic_r
                 "roi_frames_digest": roi_a_digest,
                 "masks_digest": masks_a_digest,
                 "num_frames": 1,
+                "chunks": [_CHUNK_RECORD],
                 "frames": [
                     {
                         "frame_idx": 0,
@@ -396,6 +428,8 @@ def test_round3_p0_p1_cli_generation_chain_symlink_ancestors_schema_and_atomic_r
                 "full_width": 64,
                 "full_height": 64,
                 "roi_size": 64,
+                "crop_size": 64,
+                "detector": "manual",
                 "num_frames": 1,
                 "frames": [{"frame_idx": 0, "filename": fn, "x1": 0, "y1": 0, "x2": 64, "y2": 64}],
             }
@@ -422,7 +456,8 @@ def test_round3_p0_p1_cli_generation_chain_symlink_ancestors_schema_and_atomic_r
                 "roi_frames_digest": roi_b_digest,
                 "masks_digest": masks_a_digest,
                 "num_frames": 1,
-                "frames": [],
+                "chunks": [_CHUNK_RECORD],
+                "frames": [_MASK_FRAME],
             }
         ),
         encoding="utf-8",
@@ -470,6 +505,183 @@ def test_round3_p0_p1_cli_generation_chain_symlink_ancestors_schema_and_atomic_r
     with pytest.raises(OSError):
         _workspace.atomic_swap_directory(stg, tgt)
     monkeypatch.setattr(_workspace.os, "replace", real_replace)
-    preserved_backups = list(tmp_path.glob(".old_tgt_dir_*"))
+    preserved_backups = list(tmp_path.glob(".bak_tgt_dir_*"))
     assert len(preserved_backups) == 1
     assert (preserved_backups[0] / "data.txt").read_text(encoding="utf-8") == "OLD_DATA"
+
+
+@pytest.fixture
+def verified_workspace(tmp_path: Path) -> tuple[WorkDirLayout, Path, dict, dict]:
+    from eyeglass_glare_removal.config import InpaintConfig
+    from eyeglass_glare_removal.inpaint import run_inpaint_chunks
+
+    layout = WorkDirLayout(tmp_path / "work")
+    source = tmp_path / "clip_a.mp4"
+    source.write_bytes(b"clip A")
+    fn = "000000.png"
+    for directory in (layout.frames_dir, layout.roi_frames_dir, layout.roi_lens_interior_dir,
+                      layout.roi_lens_exact_dir, layout.roi_glare_hotspot_dir):
+        directory.mkdir(parents=True)
+        Image.new("RGB" if directory.parent == layout.prep_dir else "L", (64, 64)).save(directory / fn)
+    roi_digest = hash_files_manifest(layout.roi_frames_dir, [fn])
+    mask_digests = [
+        hash_files_manifest(d, [fn])
+        for d in (layout.roi_lens_interior_dir, layout.roi_lens_exact_dir, layout.roi_glare_hotspot_dir)
+    ]
+    masks_digest = hashlib.sha256(":".join(mask_digests).encode()).hexdigest()
+    prep = {
+        "source_video": str(source), "source_sha256": hash_file_sha256(source),
+        "prep_generation": "prep", "frames_digest": hash_files_manifest(layout.frames_dir, [fn]),
+        "roi_frames_digest": roi_digest, "fps": 24, "full_width": 64, "full_height": 64,
+        "roi_size": 64, "crop_size": 64, "detector": "manual", "num_frames": 1,
+        "frames": [{"frame_idx": 0, "filename": fn, "x1": 0, "y1": 0, "x2": 64, "y2": 64}],
+    }
+    segment = {
+        "prep_generation": "prep", "segment_generation": "segment", "num_frames": 1,
+        "roi_frames_digest": roi_digest, "masks_digest": masks_digest,
+        "frames": [_MASK_FRAME], "chunks": [_CHUNK_RECORD],
+    }
+    layout.roi_boxes_json.write_text(json.dumps(prep))
+    layout.mask_stats_json.write_text(json.dumps(segment))
+    run_inpaint_chunks(
+        [layout.roi_frames_dir / fn], layout.roi_glare_hotspot_dir, layout.inpaint_dir,
+        InpaintConfig(size=64), prep_generation="prep", segment_generation="segment",
+        roi_frames_digest=roi_digest, masks_digest=masks_digest,
+    )
+    return layout, source, prep, segment
+
+
+def test_composite_explicit_source_cannot_replace_recorded_source_or_select_another_clip(
+    tmp_path: Path, verified_workspace, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    import io
+
+    from eyeglass_glare_removal import composite
+
+    layout, source, _, _ = verified_workspace
+    other = tmp_path / "clip_b.mp4"
+    other.write_bytes(b"clip B")
+    opened = []
+
+    def open_writer(*args, **kwargs):
+        opened.append(args[3])
+        return SimpleNamespace(stdin=io.BytesIO(), output=args[3])
+
+    monkeypatch.setattr(composite, "open_video_writer_pipe", open_writer)
+    monkeypatch.setattr(composite, "close_video_writer_pipe", lambda writer, _: writer.output.write_bytes(b"result"))
+    cmd = ["composite", "--work-dir", str(layout.root), "--source", str(other)]
+    assert cli.main(cmd + ["-o", str(source)]) == 1
+    assert "aliases input" in capsys.readouterr().err
+    assert source.read_bytes() == b"clip A" and not opened
+
+    output = tmp_path / "output.mp4"
+    assert cli.main(cmd + ["-o", str(output)]) == 1
+    assert "source_sha256" in capsys.readouterr().err
+    assert not output.exists() and not opened
+
+    other.write_bytes(source.read_bytes())
+    assert cli.main(cmd + ["-o", str(output)]) == 0
+    assert output.read_bytes() == b"result" and len(opened) == 1
+
+
+def test_saved_pngs_reject_symlinked_workspace_ancestor_before_encoding(
+    tmp_path: Path, verified_workspace, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    from eyeglass_glare_removal import composite
+
+    layout, _, _, _ = verified_workspace
+    outside = tmp_path / "outside"
+    publication = outside / "exports"
+    publication.mkdir(parents=True)
+    prior_frame = publication / "000000.png"
+    prior_frame.write_bytes(b"previous")
+    (layout.root / "link").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(composite, "open_video_writer_pipe", lambda *_a, **_k: pytest.fail("encoder opened"))
+    assert cli.main([
+        "composite", "--work-dir", str(layout.root), "-o", str(tmp_path / "output.mp4"),
+        "--save-frames-dir", str(layout.root / "link" / "exports"),
+    ]) == 1
+    assert "Symlinked" in capsys.readouterr().err
+    assert prior_frame.read_bytes() == b"previous"
+
+
+def test_pipeline_rejects_output_in_replaceable_prep_before_rerun(
+    tmp_path: Path, verified_workspace, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    from eyeglass_glare_removal import pipeline
+
+    layout, source, _, _ = verified_workspace
+    output = layout.prep_dir / "output.mp4"
+    output.write_bytes(b"previous")
+    source.write_bytes(b"changed")
+    monkeypatch.setattr(pipeline, "run_prep_stage", lambda *_: pytest.fail("prep ran"))
+    assert cli.main(["run", str(source), "-o", str(output), "--work-dir", str(layout.root)]) == 1
+    assert "replaceable stage" in capsys.readouterr().err
+    assert output.read_bytes() == b"previous"
+
+
+def test_reference_lineage_binds_live_roi_masks_and_reference_used_by_inpaint(
+    verified_workspace, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    from eyeglass_glare_removal import composite, pipeline
+    from eyeglass_glare_removal.config import InpaintConfig
+
+    layout, _, prep, segment = verified_workspace
+    fn = "000000.png"
+    layout.reference_dir.mkdir()
+    Image.new("RGB", (64, 64), (60, 80, 100)).save(layout.clean_eye_ref_png)
+    reference = {
+        "mode": "auto", "prep_generation": "prep", "segment_generation": "segment",
+        "roi_frames_digest": prep["roi_frames_digest"], "masks_digest": segment["masks_digest"],
+        "ref_sha256": hash_file_sha256(layout.clean_eye_ref_png),
+    }
+    layout.reference_meta_json.write_text(json.dumps(reference))
+    assert pipeline.verify_reference_artifact(layout, prep, segment) == layout.clean_eye_ref_png
+
+    Image.new("L", (64, 64), 1).save(layout.roi_glare_hotspot_dir / fn)
+    digests = [hash_files_manifest(d, [fn]) for d in (
+        layout.roi_lens_interior_dir, layout.roi_lens_exact_dir, layout.roi_glare_hotspot_dir
+    )]
+    segment["masks_digest"] = hashlib.sha256(":".join(digests).encode()).hexdigest()
+    layout.mask_stats_json.write_text(json.dumps(segment))
+    live_segment, live_mask_digest = pipeline.verify_segment_artifacts(layout, prep, [fn], prep["roi_frames_digest"])
+    assert live_segment["segment_generation"] == reference["segment_generation"]
+    with pytest.raises(ValueError, match="Stale reference.*digest"):
+        pipeline.verify_reference_artifact(layout, prep, live_segment)
+
+    reference["masks_digest"] = live_mask_digest
+    layout.reference_meta_json.write_text(json.dumps(reference))
+    pipeline.run_inpaint_chunks(
+        [layout.roi_frames_dir / fn], layout.roi_glare_hotspot_dir, layout.inpaint_dir,
+        InpaintConfig(size=64), ref_image_paths=[layout.clean_eye_ref_png], workspace_reference=True,
+        prep_generation="prep", segment_generation="segment", roi_frames_digest=prep["roi_frames_digest"],
+        masks_digest=live_mask_digest,
+    )
+    args = (layout, prep, segment, [fn], prep["roi_frames_digest"], live_mask_digest)
+    assert pipeline.verify_inpaint_artifacts(*args)[1] == [False]
+
+    Image.new("RGB", (64, 64), (70, 90, 110)).save(layout.clean_eye_ref_png)
+    reference["ref_sha256"] = hash_file_sha256(layout.clean_eye_ref_png)
+    layout.reference_meta_json.write_text(json.dumps(reference))
+    assert pipeline.verify_reference_artifact(layout, prep, segment) == layout.clean_eye_ref_png
+    monkeypatch.setattr(composite, "open_video_writer_pipe", lambda *_a, **_k: pytest.fail("encoder opened"))
+    assert cli.main([
+        "composite", "--work-dir", str(layout.root), "-o", str(layout.root / "out.mp4"),
+    ]) == 1
+    assert "Inpaint reference no longer matches" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("invalid_flag", ["false", 1, None])
+def test_composite_rejects_non_boolean_edit_flags_with_valid_digests(
+    verified_workspace, invalid_flag,
+) -> None:
+    from eyeglass_glare_removal.pipeline import verify_inpaint_artifacts
+
+    layout, _, prep, segment = verified_workspace
+    args = (layout, prep, segment, ["000000.png"], prep["roi_frames_digest"], segment["masks_digest"])
+    assert verify_inpaint_artifacts(*args)[1] == [False]
+    edit_support = json.loads(layout.edit_support_json.read_text())
+    edit_support["frame_has_edit"] = [invalid_flag]
+    layout.edit_support_json.write_text(json.dumps(edit_support))
+    with pytest.raises(ValueError, match="frame_has_edit"):
+        verify_inpaint_artifacts(*args)

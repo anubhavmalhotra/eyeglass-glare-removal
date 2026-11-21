@@ -684,6 +684,7 @@ def compute_prep_generation(source_sha256: str, config: PrepConfig) -> str:
     """Content-bound generation hash identifying source bytes + effective prep settings."""
     payload = json.dumps(
         {
+            "audio_timeline_version": 2,
             "source_sha256": source_sha256,
             "start_sec": config.start_sec,
             "duration_sec": config.duration_sec,

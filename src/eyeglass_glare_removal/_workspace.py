@@ -7,9 +7,11 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 from PIL import Image
 
@@ -327,103 +329,117 @@ def atomic_swap_directory(staging_dir: Path, target_dir: Path) -> None:
     - Handles `BaseException` (including KeyboardInterrupt) for rollback.
     - Preserves `backup_dir` on disk if rollback itself fails so previous artifacts are never lost.
     """
-    reject_symlink_path(target_dir.parent, "parent directory")
-    reject_symlink_path(target_dir, "target directory")
-    reject_symlink_path(staging_dir, "staging directory")
+    atomic_commit_paths([(staging_dir, target_dir)])
 
-    backup_dir: Path | None = None
-    committed = False
-    rollback_succeeded = False
+
+@contextlib.contextmanager
+def open_export_directory(path: Path, workspace_root: Path | None) -> Iterator[int]:
+    """Open a PNG export directory without following symlinks under the workspace anchor."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    absolute = path.absolute()
+    if ".." in absolute.parts:
+        raise ValueError(f"Parent traversal '..' forbidden in PNG export path: {path}")
+    if workspace_root is not None and absolute.is_relative_to(workspace_root.absolute()):
+        anchor = workspace_root.absolute()
+        reject_symlink_components_under(anchor, absolute)
+    else:
+        reject_symlink_path(path, "save_frames_dir")
+        anchor = absolute.parent.resolve()
+        absolute = anchor / path.name
+    anchor.mkdir(parents=True, exist_ok=True)
+    fd = os.open(anchor, flags)
     try:
-        if target_dir.exists():
-            backup_dir = Path(
-                tempfile.mkdtemp(dir=str(target_dir.parent), prefix=f".old_{target_dir.name}_")
-            )
-            backup_dir.rmdir()
-            os.replace(target_dir, backup_dir)
-        os.replace(staging_dir, target_dir)
-        committed = True
-    except BaseException:
-        if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
+        for part in absolute.relative_to(anchor).parts:
             try:
-                os.replace(backup_dir, target_dir)
-                rollback_succeeded = True
-            except OSError as rb_exc:
-                logger.error(
-                    "Rollback failed restoring %s from %s (%s); preserving backup copy at %s.",
-                    target_dir,
-                    backup_dir,
-                    rb_exc,
-                    backup_dir,
-                )
-        raise
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+        yield fd
     finally:
-        # Delete backup ONLY when commit succeeded or rollback cleanly restored target_dir
-        if backup_dir is not None and backup_dir.exists() and (committed or rollback_succeeded):
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        os.close(fd)
 
 
-def atomic_commit_paths(staged_to_dest: list[tuple[Path, Path]]) -> None:
-    """
-    Commit multiple staged files and/or directories into their final destinations as one
-    rollback-safe transaction.
+def atomic_commit_paths(
+    staged_to_dest: list[tuple[Path, Path]],
+    *,
+    directory_fds: dict[Path, int] | None = None,
+) -> None:
+    """Publish files and directories, preserving old destinations on an interrupted commit."""
+    fds = directory_fds or {}
 
-    - Handles `BaseException` (including KeyboardInterrupt) for rollback.
-    - Rolls back directories cleanly by moving the newly swapped destination back to its
-      staging path before restoring its backup (avoiding POSIX ENOTEMPTY).
-    - Preserves backup copies on disk if rollback itself fails.
-    """
-    if not staged_to_dest:
-        return
+    def inspect(path: Path) -> os.stat_result | None:
+        try:
+            if path.parent in fds:
+                return os.stat(path.name, dir_fd=fds[path.parent], follow_symlinks=False)
+            return path.lstat()
+        except FileNotFoundError:
+            return None
+
+    def replace(src: Path, dst: Path) -> None:
+        if src.parent in fds or dst.parent in fds:
+            os.replace(
+                src.name if src.parent in fds else src,
+                dst.name if dst.parent in fds else dst,
+                src_dir_fd=fds.get(src.parent),
+                dst_dir_fd=fds.get(dst.parent),
+            )
+        else:
+            os.replace(src, dst)
 
     for staged, dest in staged_to_dest:
-        reject_symlink_path(dest.parent, "destination parent directory")
-        reject_symlink_path(dest, "destination path")
-        reject_symlink_path(staged, "staged path")
+        if dest.parent not in fds:
+            reject_symlink_path(dest.parent, "destination parent directory")
+        for path in (staged, dest):
+            info = inspect(path)
+            if info is None:
+                if path == staged:
+                    raise FileNotFoundError(f"Missing staged transaction path: {staged}")
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"Symlinked transaction path is not allowed: {path}")
+            if path.parent in fds and not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"Expected a regular transaction file: {path}")
 
-    # Each entry: (staged, dest, backup_path_or_None, dest_was_swapped_in)
-    applied: list[tuple[Path, Path, Path | None, bool]] = []
-    committed = False
-    rollback_ok = True
+    applied: list[tuple[Path, Path, Path | None]] = []
     try:
         for staged, dest in staged_to_dest:
-            backup: Path | None = None
-            if dest.exists():
-                backup = Path(
-                    tempfile.mkdtemp(dir=str(dest.parent), prefix=f".bak_{dest.name}_")
-                )
-                backup.rmdir()
-                os.replace(dest, backup)
-            # Record backup before swapping staged -> dest so even if the second replace fails,
-            # backup is restored cleanly.
-            applied.append((staged, dest, backup, False))
-            os.replace(staged, dest)
-            applied[-1] = (staged, dest, backup, True)
-        committed = True
+            backup = None
+            if inspect(dest) is not None:
+                backup = dest.with_name(f".bak_{dest.name}_{uuid4().hex}")
+            # Register intent before either rename. A signal can arrive after the syscall
+            # succeeded, so rollback uses the presence of the staging path and backup.
+            applied.append((staged, dest, backup))
+            if backup is not None:
+                replace(dest, backup)
+            replace(staged, dest)
     except BaseException:
-        for staged, dest, backup, swapped in reversed(applied):
+        for staged, dest, backup in reversed(applied):
             try:
-                if swapped and dest.exists():
-                    os.replace(dest, staged)
-                if backup is not None and backup.exists() and not dest.exists():
-                    os.replace(backup, dest)
-            except OSError as rb_exc:
-                rollback_ok = False
+                if inspect(staged) is None and inspect(dest) is not None:
+                    replace(dest, staged)
+                if backup is not None and inspect(backup) is not None:
+                    if inspect(dest) is not None:
+                        raise OSError("destination still exists")
+                    replace(backup, dest)
+            except OSError as exc:
                 logger.error(
                     "Rollback failed restoring %s from backup %s (%s); preserving backup.",
-                    dest,
-                    backup,
-                    rb_exc,
+                    dest, backup, exc,
                 )
         raise
-    finally:
-        if committed or rollback_ok:
-            for _, _, backup, _ in applied:
-                if backup is not None and backup.exists():
-                    if backup.is_dir() and not backup.is_symlink():
-                        shutil.rmtree(backup, ignore_errors=True)
-                    else:
-                        backup.unlink(missing_ok=True)
+
+    for _, _, backup in applied:
+        if backup is None:
+            continue
+        if backup.parent in fds:
+            os.unlink(backup.name, dir_fd=fds[backup.parent])
+        elif backup.is_dir():
+            shutil.rmtree(backup, ignore_errors=True)
+        else:
+            backup.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager

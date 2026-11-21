@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from eyeglass_glare_removal.reference import build_clean_reference
 from eyeglass_glare_removal.segment import (
     build_initial_lens_prompts,
     compute_segment_generation,
+    resolve_segment_identity,
     run_segment_stage,
 )
 
@@ -151,10 +153,33 @@ def _extract_safe_filenames(meta: dict[str, Any], label: str) -> list[str]:
     frames = meta.get("frames")
     if not isinstance(frames, list) or len(frames) != raw_n:
         raise ValueError(f"Invalid frames list in {label}: expected {raw_n} entries")
+    dimensions = ("full_width", "full_height", "roi_size", "crop_size")
+    if (
+        any(type(meta.get(key)) is not int or meta[key] <= 0 for key in dimensions)
+        or type(meta.get("fps")) not in (int, float)
+        or not math.isfinite(meta["fps"])
+        or meta["fps"] <= 0
+        or not isinstance(meta.get("detector"), str)
+    ):
+        raise ValueError(f"Invalid video properties in {label}")
+    video_metadata = meta.get("video_metadata")
+    audio_offset = meta.get("audio_offset_sec")
+    if (video_metadata is not None and not isinstance(video_metadata, dict)) or (
+        audio_offset is not None
+        and (type(audio_offset) not in (int, float) or not math.isfinite(audio_offset))
+    ):
+        raise ValueError(f"Invalid media metadata in {label}")
     filenames: list[str] = []
     for i, rec in enumerate(frames):
         if not isinstance(rec, dict) or not isinstance(rec.get("filename"), str):
             raise ValueError(f"Invalid frame record at index {i} in {label}")
+        if (
+            type(rec.get("frame_idx")) is not int or rec["frame_idx"] != i
+            or any(type(rec.get(key)) is not int for key in ("x1", "y1", "x2", "y2"))
+            or not 0 <= rec["x1"] < rec["x2"] <= meta["full_width"]
+            or not 0 <= rec["y1"] < rec["y2"] <= meta["full_height"]
+        ):
+            raise ValueError(f"Invalid ROI box at frame {i} in {label}")
         filenames.append(validate_safe_basename(rec["filename"]))
     return filenames
 
@@ -224,6 +249,50 @@ def verify_prep_artifacts(
     return meta, filenames, live_frames_digest, live_roi_digest
 
 
+def _validate_segment_records(stats: dict[str, Any], n: int) -> None:
+    chunks = stats.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        raise ValueError("Invalid segment chunks; rerun `glare-remove segment`.")
+    for chunk in chunks:
+        if (
+            not isinstance(chunk, dict)
+            or any(type(chunk.get(key)) is not int for key in ("start", "end", "chunk_idx", "start_write"))
+            or not 0 <= chunk["start"] < chunk["end"] <= n
+            or not 0 <= chunk["start_write"] < chunk["end"] - chunk["start"]
+            or chunk["chunk_idx"] < 0
+            or any(type(chunk.get(key)) is not bool for key in ("from_checkpoint", "used_fallback"))
+        ):
+            raise ValueError("Invalid segment chunk record; rerun `glare-remove segment`.")
+    glare_summary = stats.get("glare_pct_min_med_max")
+    if glare_summary is not None and (
+        not isinstance(glare_summary, list)
+        or len(glare_summary) != 3
+        or any(type(value) not in (int, float) or not 0 <= value <= 100 for value in glare_summary)
+    ):
+        raise ValueError("Invalid segment glare summary; rerun `glare-remove segment`.")
+    peak = stats.get("peak_vram_gib")
+    if peak is not None and (type(peak) not in (int, float) or not math.isfinite(peak) or peak < 0):
+        raise ValueError("Invalid segment peak VRAM; rerun `glare-remove segment`.")
+    frames = stats.get("frames")
+    if not isinstance(frames, list) or len(frames) != n:
+        raise ValueError("Invalid segment frames; rerun `glare-remove segment`.")
+    for i, frame in enumerate(frames):
+        if (
+            not isinstance(frame, dict)
+            or type(frame.get("frame_idx")) is not int
+            or frame["frame_idx"] != i
+            or any(
+                type(frame.get(key)) is not int or frame[key] < 0
+                for key in ("left_lens_roi_px", "right_lens_roi_px")
+            )
+            or any(
+                type(frame.get(key)) not in (int, float) or not 0 <= frame[key] <= 100
+                for key in ("glare_left_pct", "glare_right_pct")
+            )
+        ):
+            raise ValueError("Invalid segment frame record; rerun `glare-remove segment`.")
+
+
 def verify_segment_artifacts(
     layout: WorkDirLayout,
     roi_meta: dict[str, Any],
@@ -248,6 +317,7 @@ def verify_segment_artifacts(
             f"({len(filenames)}); rerun `glare-remove segment`."
         )
 
+    _validate_segment_records(stats, len(filenames))
     prep_gen = roi_meta.get("prep_generation")
     seg_prep_gen = stats.get("prep_generation")
     seg_gen = stats.get("segment_generation")
@@ -316,6 +386,11 @@ def verify_reference_artifact(
             f"Stale reference/clean_eye_ref.png: segment_generation ({ref_meta.get('segment_generation')!r}) "
             f"!= current masks ({seg_gen!r}). Rerun `glare-remove reference`, or pass `--no-ref` / `--ref-image`."
         )
+    if ref_meta.get("roi_frames_digest") != roi_meta.get("roi_frames_digest") or (
+        ref_meta.get("mode") == "auto"
+        and ref_meta.get("masks_digest") != mask_stats.get("masks_digest")
+    ):
+        raise ValueError("Stale reference upstream digest; rerun `glare-remove reference`.")
     expected_sha = ref_meta.get("ref_sha256")
     if not isinstance(expected_sha, str) or hash_file_sha256(layout.clean_eye_ref_png) != expected_sha:
         raise ValueError(
@@ -373,12 +448,36 @@ def verify_inpaint_artifacts(
         )
 
     raw_flags = es.get("frame_has_edit")
-    if not isinstance(raw_flags, list) or len(raw_flags) != len(filenames):
+    if (
+        not isinstance(raw_flags, list)
+        or len(raw_flags) != len(filenames)
+        or any(type(flag) is not bool for flag in raw_flags)
+    ):
         raise ValueError(
             "Inpaint manifest edit_support.json has invalid frame_has_edit list; "
             "rerun `glare-remove inpaint`."
         )
-    frame_has_edit = [bool(v) for v in raw_flags]
+    reference_digests = es.get("reference_digests")
+    workspace_reference = es.get("workspace_reference")
+    if (
+        not isinstance(reference_digests, list)
+        or any(not isinstance(digest, str) or len(digest) != 64 for digest in reference_digests)
+        or type(workspace_reference) is not bool
+    ):
+        raise ValueError("Missing inpaint reference identity; rerun `glare-remove inpaint`.")
+    summary_path = layout.inpaint_dir / "inpaint_summary.json"
+    reject_symlink_components_under(layout.root, summary_path)
+    summary = _load_json_dict(summary_path, "inpaint_summary.json")
+    if (
+        summary.get("inpaint_generation") != es.get("inpaint_generation")
+        or summary.get("reference_digests") != reference_digests
+        or summary.get("workspace_reference") is not workspace_reference
+    ):
+        raise ValueError("Inpaint reference identity mismatch; rerun `glare-remove inpaint`.")
+    if workspace_reference:
+        current_ref = verify_reference_artifact(layout, roi_meta, mask_stats)
+        if current_ref is None or reference_digests != [hash_file_sha256(current_ref)]:
+            raise ValueError("Inpaint reference no longer matches; rerun `glare-remove inpaint`.")
 
     live_cleaned_digest = hash_files_manifest(
         layout.roi_cleaned_dir, filenames, workspace_root=layout.root
@@ -389,7 +488,7 @@ def verify_inpaint_artifacts(
             "rerun `glare-remove inpaint`."
         )
 
-    return es, frame_has_edit
+    return es, raw_flags
 
 
 def _prep_matches_config(layout: WorkDirLayout, config: PipelineConfig) -> dict[str, Any] | None:
@@ -490,6 +589,7 @@ def _segment_is_complete(
         if isinstance(raw_sn, bool) or not isinstance(raw_sn, int) or raw_sn != n:
             return None
 
+        _validate_segment_records(stats, n)
         prep_gen = roi_meta.get("prep_generation")
         if prep_gen and stats.get("prep_generation") != prep_gen:
             return None
@@ -505,8 +605,12 @@ def _segment_is_complete(
             roi_size=roi_size,
             override_prompts=config.segment.lens_points,
         )
+        import torch
+
+        device, dtype, model = resolve_segment_identity(config.segment, torch)
         _, expected_seg_gen = compute_segment_generation(
-            roi_frames_digest, seed_idx, init_left, init_right, config.segment
+            roi_frames_digest, seed_idx, init_left, init_right, config.segment,
+            runtime_identity=(str(device), str(dtype), model, torch.__version__),
         )
         if stats.get("segment_generation") != expected_seg_gen:
             return None
@@ -608,6 +712,7 @@ def build_dry_run_plan(config: PipelineConfig) -> dict[str, Any]:
 
 def run_pipeline(config: PipelineConfig, *, dry_run: bool = False) -> dict[str, Any]:
     """Execute the full 5-stage eyeglass glare removal pipeline under an exclusive workdir lock."""
+    config.validate_publish_destinations()
     if dry_run:
         return build_dry_run_plan(config)
 
@@ -679,15 +784,13 @@ def run_pipeline(config: PipelineConfig, *, dry_run: bool = False) -> dict[str, 
             segment_generation=mask_stats.get("segment_generation"),
             roi_frames_digest=roi_meta.get("roi_frames_digest"),
             masks_digest=mask_stats.get("masks_digest"),
+            workspace_reference=ref_result.ref_path is not None,
         )
 
-        # Load verified per-frame edit flags so clean frames bypass ROI resampling completely
-        frame_has_edit: list[bool] | None = None
-        if layout.edit_support_json.exists():
-            reject_symlink_components_under(layout.root, layout.edit_support_json)
-            es = _load_json_dict(layout.edit_support_json, "edit_support.json")
-            if isinstance(es.get("frame_has_edit"), list):
-                frame_has_edit = [bool(v) for v in es["frame_has_edit"]]
+        _, frame_has_edit = verify_inpaint_artifacts(
+            layout, roi_meta, mask_stats, [path.name for path in roi_frame_paths],
+            roi_meta["roi_frames_digest"], mask_stats["masks_digest"],
+        )
 
         # Stage 5: Rim-Safe Streaming Compositor
         logger.info("[5/5] Running rim-safe streaming compositor -> %s", config.output_path)
@@ -705,6 +808,7 @@ def run_pipeline(config: PipelineConfig, *, dry_run: bool = False) -> dict[str, 
             audio_path=audio_p,
             source_video_path=config.input_path,
             frame_has_edit=frame_has_edit,
+            workspace_root=layout.root,
         )
 
     return {
@@ -717,7 +821,7 @@ def run_pipeline(config: PipelineConfig, *, dry_run: bool = False) -> dict[str, 
             "has_audio": audio_p is not None,
         },
         "segment": {
-            "chunks": len(mask_stats.get("chunks", [])),
+            "chunks": len(mask_stats["chunks"]),
             "glare_pct_min_med_max": mask_stats.get("glare_pct_min_med_max"),
             "peak_vram_gib": mask_stats.get("peak_vram_gib"),
         },

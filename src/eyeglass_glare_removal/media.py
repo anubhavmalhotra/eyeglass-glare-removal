@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -53,7 +53,7 @@ _SAFE_COLOR_TRC = frozenset(
         "arib-std-b67",
     }
 )
-_YUV_MATRIX_MAP = {
+_ENCODER_MATRIX_MAP = {
     "bt709": "bt709",
     "smpte170m": "smpte170m",
     "bt470bg": "bt470bg",
@@ -63,6 +63,7 @@ _YUV_MATRIX_MAP = {
     "bt2020c": "bt2020nc",
     "bt2020": "bt2020nc",
 }
+_SCALE_MATRIX_MAP = {"bt470bg": "bt470", "bt2020nc": "bt2020"}
 _SAFE_COLOR_RANGES = frozenset({"tv", "pc"})
 _SAR_PATTERN = re.compile(r"^([1-9]\d*):([1-9]\d*)$")
 
@@ -93,6 +94,9 @@ class VideoMetadata:
     color_trc: str | None = None
     colorspace: str | None = None
     color_range: str | None = None
+    format_start_time: float | None = None
+    extracted_video_start: float | None = None
+    extracted_audio_start: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -314,7 +318,7 @@ def parse_ffprobe_payload(path: Path | str, payload: dict[str, Any]) -> VideoMet
             duration_sec = None
 
     raw_cs = (video_stream.get("color_space") or "").strip().lower()
-    norm_cs = _YUV_MATRIX_MAP.get(raw_cs)
+    norm_cs = _ENCODER_MATRIX_MAP.get(raw_cs)
 
     return VideoMetadata(
         path=str(path),
@@ -339,6 +343,7 @@ def parse_ffprobe_payload(path: Path | str, payload: dict[str, Any]) -> VideoMet
         color_trc=_sanitize_tag(video_stream.get("color_transfer"), _SAFE_COLOR_TRC),
         colorspace=norm_cs,
         color_range=_sanitize_tag(video_stream.get("color_range"), _SAFE_COLOR_RANGES),
+        format_start_time=_parse_start_time(fmt) if fmt.get("start_time") not in (None, "", "N/A") else None,
     )
 
 
@@ -369,13 +374,10 @@ def probe_video(path: Path | str) -> VideoMetadata:
     return parse_ffprobe_payload(video_path, payload)
 
 
-def probe_audio_has_packets(audio_path: Path) -> bool:
-    """
-    Strictly verify an extracted audio file contains a valid audio stream with an actual
-    positive packet count (`nb_read_packets > 0` or `nb_packets > 0`).
-    """
+def _probe_audio_stream_with_packets(audio_path: Path) -> dict[str, Any] | None:
+    """Return the audio stream metadata only when ffprobe counts positive packets."""
     if not audio_path.exists() or audio_path.stat().st_size == 0:
-        return False
+        return None
     ffprobe = require_binary("ffprobe")
     proc = run_subprocess(
         [
@@ -395,44 +397,49 @@ def probe_audio_has_packets(audio_path: Path) -> bool:
         check=False,
     )
     if proc.returncode != 0:
-        return False
+        return None
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        return False
+        return None
     streams = payload.get("streams") or []
     if not streams:
-        return False
+        return None
     st = streams[0]
     if st.get("codec_type") != "audio":
-        return False
+        return None
     for key in ("nb_read_packets", "nb_packets"):
         raw = st.get(key)
         if raw not in (None, "N/A", ""):
             try:
-                return int(raw) > 0
-            except ValueError:
-                return False
-    return False
+                return st if int(raw) > 0 else None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def probe_audio_has_packets(audio_path: Path) -> bool:
+    """Verify an audio file contains an audio stream with actual packets."""
+    return _probe_audio_stream_with_packets(audio_path) is not None
 
 
 def compute_audio_offset_sec(meta: VideoMetadata, start_sec: float = 0.0) -> float:
-    """
-    Compute the audio-relative-to-video start offset on the output CFR timeline.
-
-    When rawvideo starts at 0.0 (corresponding to `video_origin = max(video_start_time, start_sec)`),
-    preserving `audio_origin - video_origin` via `-itsoffset` retains intentional A/V lead/delay.
-    """
+    """Compare extracted stream origins measured from the same container seek."""
+    if meta.extracted_audio_start is not None and meta.extracted_video_start is not None:
+        return round(meta.extracted_audio_start - meta.extracted_video_start, 6)
     if not meta.has_audio or meta.audio_start_time is None:
         return 0.0
-    v_start = float(meta.video_start_time or 0.0)
-    a_start = float(meta.audio_start_time)
-    if start_sec <= 0.0:
-        offset = a_start - v_start
-    else:
-        v_origin = max(v_start, float(start_sec))
-        a_origin = max(a_start, float(start_sec))
-        offset = a_origin - v_origin
+    video_origin = meta.video_start_time
+    audio_origin = meta.audio_start_time
+    if start_sec > 0:
+        # Input -ss is measured from the container start, not absolute stream PTS.
+        input_origin = meta.format_start_time
+        if input_origin is None:
+            input_origin = min(video_origin, audio_origin)
+        seek_pts = input_origin + start_sec
+        video_origin = max(video_origin, seek_pts)
+        audio_origin = max(audio_origin, seek_pts)
+    offset = audio_origin - video_origin
     return round(offset, 6) if math.isfinite(offset) else 0.0
 
 
@@ -484,12 +491,13 @@ def extract_cfr_frames(
 
     # 1. Extract and strictly verify audio packets only if source has an audio stream
     audio_path: Path | None = None
+    extracted_audio_start: float | None = None
     final_audio = out_dir / "audio.m4a"
     reject_symlink_path(final_audio, "audio output file")
     if meta.has_audio and meta.audio_stream_index is not None:
         tmp_audio = make_unique_temp_sibling(final_audio)
         try:
-            can_stream_copy = (meta.audio_codec == "aac") and (is_full or start_sec == 0.0)
+            can_stream_copy = meta.audio_codec == "aac" and start_sec == 0.0
             audio_cmd = [ffmpeg, "-y", "-v", "error", "-protocol_whitelist", "file"]
             if start_sec > 0.0:
                 audio_cmd += ["-ss", f"{start_sec:.6f}"]
@@ -501,10 +509,13 @@ def extract_cfr_frames(
                 audio_cmd += ["-c:a", "copy"]
             else:
                 audio_cmd += ["-c:a", "aac", "-b:a", "192k"]
-            audio_cmd += [ffmpeg_local_path(tmp_audio)]
+            audio_cmd += ["-avoid_negative_ts", "disabled", ffmpeg_local_path(tmp_audio)]
 
             proc_a = run_subprocess(audio_cmd, check=False)
-            if proc_a.returncode == 0 and probe_audio_has_packets(tmp_audio):
+            audio_stream = _probe_audio_stream_with_packets(tmp_audio) if proc_a.returncode == 0 else None
+            if audio_stream is not None:
+                if audio_stream.get("start_time") not in (None, "", "N/A"):
+                    extracted_audio_start = _parse_start_time(audio_stream)
                 os.replace(tmp_audio, final_audio)
                 audio_path = final_audio
             else:
@@ -524,8 +535,9 @@ def extract_cfr_frames(
 
     # 2. Extract auto-rotated CFR PNG frames into a unique staging dir, escaping `%` in dir path
     stage_frames_dir = make_unique_temp_dir(out_dir, prefix=".stage_frames_")
+    extracted_video_start: float | None = None
     try:
-        out_pattern = ffmpeg_image2_pattern(stage_frames_dir, "%06d.png")
+        out_pattern = ffmpeg_image2_pattern(stage_frames_dir, "pts_%06d.png")
         fps_filter = f"fps=fps={fps_str}:round=near:eof_action=pass"
 
         frame_cmd = [ffmpeg, "-y", "-v", "error", "-protocol_whitelist", "file"]
@@ -546,35 +558,36 @@ def extract_cfr_frames(
         else:
             frame_cmd += ["-vf", fps_filter]
 
-        frame_cmd += ["-start_number", "0", out_pattern]
-        run_subprocess(frame_cmd)
+        # Preserve timestamps in the intermediate names so the first frame's PTS
+        # is available after extraction. Both commands normalize the same input seek.
+        rate = Fraction(fps_str)
+        pts_options = [
+            "-vsync", "passthrough",
+            "-enc_time_base", f"{rate.denominator}/{rate.numerator}",
+            "-frame_pts", "1", out_pattern,
+        ]
+        run_subprocess(frame_cmd + pts_options)
 
-        staged_pngs = sorted(stage_frames_dir.glob("*.png"))
-        if not staged_pngs:
+        pts_frames = list(stage_frames_dir.glob("pts_*.png"))
+        if not pts_frames:
             fallback_cmd = [ffmpeg, "-y", "-v", "error", "-protocol_whitelist", "file"]
             if start_sec > 0.0:
                 fallback_cmd += ["-ss", f"{start_sec:.6f}"]
-            fallback_cmd += [
-                "-i",
-                src_arg,
-                "-map",
-                f"0:{meta.video_stream_index}",
-                "-frames:v",
-                "1",
-                "-start_number",
-                "0",
-                out_pattern,
-            ]
-            run_subprocess(fallback_cmd, check=False)
-            staged_pngs = sorted(stage_frames_dir.glob("*.png"))
+            fallback_cmd += ["-i", src_arg, "-map", f"0:{meta.video_stream_index}", "-frames:v", "1"]
+            run_subprocess(fallback_cmd + pts_options, check=False)
+            pts_frames = list(stage_frames_dir.glob("pts_*.png"))
 
-        if not staged_pngs:
+        if not pts_frames:
             raise RuntimeError(
                 f"No video frames extracted from {source_path} "
                 f"(start_sec={start_sec}, duration_sec={duration_sec}). "
                 "Check that --start is within the video duration."
             )
 
+        ordered = sorted((int(path.stem[4:]), path) for path in pts_frames)
+        extracted_video_start = ordered[0][0] / float(rate)
+        for i, (_, path) in enumerate(ordered):
+            os.replace(path, stage_frames_dir / f"{i:06d}.png")
         atomic_swap_directory(stage_frames_dir, frames_dir)
     except BaseException:
         if stage_frames_dir.exists():
@@ -582,7 +595,10 @@ def extract_cfr_frames(
         raise
 
     frame_paths = sorted(frames_dir.glob("*.png"))
-    return frame_paths, audio_path, meta, fps
+    measured = replace(
+        meta, extracted_video_start=extracted_video_start, extracted_audio_start=extracted_audio_start,
+    )
+    return frame_paths, audio_path, measured, fps
 
 
 def build_video_writer_cmd(
@@ -637,11 +653,7 @@ def build_video_writer_cmd(
         "-i",
         "pipe:0",
     ]
-    has_audio = (
-        audio_path is not None
-        and Path(audio_path).exists()
-        and Path(audio_path).stat().st_size > 0
-    )
+    has_audio = audio_path is not None and probe_audio_has_packets(Path(audio_path))
     if has_audio:
         assert audio_path is not None
         if math.isfinite(audio_offset_sec) and abs(audio_offset_sec) > 1e-4:
@@ -649,14 +661,15 @@ def build_video_writer_cmd(
         cmd += ["-i", ffmpeg_local_path(audio_path, must_exist=True)]
 
     vf_parts: list[str] = []
-    out_matrix = _YUV_MATRIX_MAP.get((colorspace or "").strip().lower(), "bt709")
+    out_matrix = _ENCODER_MATRIX_MAP.get((colorspace or "").strip().lower(), "bt709")
     out_range = _sanitize_tag(color_range, _SAFE_COLOR_RANGES) or "tv"
 
     if not lossless:
         if (width % 2 != 0) or (height % 2 != 0):
             vf_parts.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
         # Explicitly convert RGB24 -> YUV420p using the exact signaled matrix & range
-        vf_parts.append(f"scale=out_color_matrix={out_matrix}:out_range={out_range}")
+        scale_matrix = _SCALE_MATRIX_MAP.get(out_matrix, out_matrix)
+        vf_parts.append(f"scale=out_color_matrix={scale_matrix}:out_range={out_range}")
 
     sar = _sanitize_sar(sample_aspect_ratio, invert=False)
     if sar is not None and sar != "1:1":

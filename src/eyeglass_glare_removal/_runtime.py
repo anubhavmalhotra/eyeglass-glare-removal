@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+from eyeglass_glare_removal._workspace import hash_file_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ def resolve_torch_device(torch_module: Any, device_str: str = "auto") -> Any:
             resolved = "mps"
         else:
             resolved = "cpu"
-        return torch_module.device(resolved)
+        device_str = resolved
 
     if device_str.startswith("cuda") and not torch_module.cuda.is_available():
         raise RuntimeError(
@@ -59,17 +62,74 @@ def resolve_torch_device(torch_module: Any, device_str: str = "auto") -> Any:
         hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available()
     ):
         raise RuntimeError("Requested device 'mps', but MPS is not available.")
-    return torch_module.device(device_str)
+    device = torch_module.device(device_str)
+    if device.type == "cuda" and device.index is None:
+        device = torch_module.device(f"cuda:{torch_module.cuda.current_device()}")
+    return device
 
 
 def preferred_inference_dtype(torch_module: Any, device: Any) -> Any:
     """Pick bfloat16 on CUDA (when supported, else float16), and float32 on CPU/MPS."""
     if getattr(device, "type", "") == "cuda":
         is_bf16 = getattr(torch_module.cuda, "is_bf16_supported", None)
-        if callable(is_bf16) and is_bf16():
-            return torch_module.bfloat16
+        if callable(is_bf16):
+            with torch_module.cuda.device(device):
+                if is_bf16():
+                    return torch_module.bfloat16
         return torch_module.float16
     return torch_module.float32
+
+
+def resolve_model_identity(model_id: str, config_files: tuple[str, ...]) -> str:
+    """Identify local model assets or resolve the exact hub commit to load."""
+    root = Path(model_id)
+    if root.is_dir():
+        h = hashlib.sha256()
+        for directory, subdirs, files in os.walk(root, followlinks=True):
+            path = Path(directory)
+            ancestors = {ancestor.resolve() for ancestor in path.parents if ancestor.is_relative_to(root)}
+            subdirs[:] = sorted(
+                name for name in subdirs
+                if not name.startswith(".") and (path / name).resolve() not in ancestors | {path.resolve()}
+            )
+            for name in sorted(files):
+                asset = path / name
+                if asset.is_file() and not name.startswith("."):
+                    h.update(str(asset.relative_to(root)).encode())
+                    h.update(b"\0")
+                    h.update(hash_file_sha256(asset).encode("ascii"))
+        return f"local:{h.hexdigest()}"
+
+    from huggingface_hub import HfApi, try_to_load_from_cache
+
+    def commit_identity(revision: str | None) -> str | None:
+        if revision and len(revision) == 40 and all(c in "0123456789abcdef" for c in revision):
+            return f"hf:{revision}"
+        return None
+
+    lookup_error = None
+    try:
+        revision = HfApi().model_info(model_id, timeout=5).sha
+    except Exception as exc:
+        # Hub versions use different HTTP clients and offline exception types.
+        lookup_error = exc
+    else:
+        identity = commit_identity(revision)
+        if identity is not None:
+            return identity
+
+    for filename in config_files:
+        cached = try_to_load_from_cache(model_id, filename)
+        if isinstance(cached, str) and "/snapshots/" in cached:
+            identity = commit_identity(cached.split("/snapshots/", 1)[1].split("/", 1)[0])
+            if identity is not None:
+                return identity
+    raise RuntimeError(f"Could not resolve an immutable model revision for {model_id!r}.") from lookup_error
+
+
+def model_revision_kwargs(identity: str | None) -> dict[str, str]:
+    """Pass the exact resolved hub commit to every loader of this model."""
+    return {"revision": identity[3:]} if identity and identity.startswith("hf:") else {}
 
 
 def cuda_empty_cache_if_needed(torch_module: Any, device: Any | None = None) -> None:

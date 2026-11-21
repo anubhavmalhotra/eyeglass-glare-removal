@@ -337,6 +337,17 @@ class PipelineConfig:
         else:
             self.work_dir = self.output_path.parent / f"{self.output_path.stem}.work"
 
+        self.validate_publish_destinations()
+
+        if self.reference.roi_size != self.prep.roi_size:
+            raise ValueError(
+                f"reference.roi_size ({self.reference.roi_size}) must match "
+                f"prep.roi_size ({self.prep.roi_size})"
+            )
+
+    def validate_publish_destinations(self) -> None:
+        """Keep published artifacts clear of the source and replaceable stage directories."""
+        assert self.work_dir is not None
         # Prevent output or derived compare/qa artifacts from clobbering input media
         derived_compare = (
             self.output_path.with_name(f"{self.output_path.stem}_compare.mp4")
@@ -357,8 +368,13 @@ class PipelineConfig:
             ],
         )
 
-        if self.reference.roi_size != self.prep.roi_size:
-            raise ValueError(
-                f"reference.roi_size ({self.reference.roi_size}) must match "
-                f"prep.roi_size ({self.prep.roi_size})"
-            )
+        for destination in (self.output_path, derived_compare, derived_qa, self.composite.save_frames_dir):
+            if destination is None:
+                continue
+            for stage in ("prep", "masks", "reference", "inpaint"):
+                managed = self.work_dir / stage
+                if (
+                    destination.absolute().is_relative_to(managed.absolute())
+                    or destination.resolve().is_relative_to(managed.resolve())
+                ):
+                    raise ValueError(f"Published destination ({destination}) is inside replaceable stage ({managed}).")

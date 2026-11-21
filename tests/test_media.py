@@ -159,7 +159,8 @@ def test_extract_cfr_frames_maps_stream_checks_audio_packets_and_1frame_fallback
             if any("fps=fps=10" in c for c in cmd):
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             for i in range(3):
-                (fdir / f"{i:06d}.png").write_bytes(b"fake_png")
+                name = Path(raw_path).name.replace("%06d", f"{i:06d}")
+                (fdir / name).write_bytes(b"fake_png")
         elif ".m4a" in out_arg:
             raw_path = out_arg[5:] if out_arg.startswith("file:") else out_arg
             Path(raw_path).write_bytes(b"fake_aac_bytes")
@@ -169,7 +170,7 @@ def test_extract_cfr_frames_maps_stream_checks_audio_packets_and_1frame_fallback
     monkeypatch.setattr(media, "run_subprocess", fake_run)
 
     # 1) Opus audio with valid packets -> transcoded to AAC, explicit -map 0:<idx> & protocol_whitelist
-    monkeypatch.setattr(media, "probe_audio_has_packets", lambda _p: True)
+    monkeypatch.setattr(media, "_probe_audio_stream_with_packets", lambda _p: {"start_time": "0"})
     src = tmp_path / "web.mkv"
     src.write_bytes(b"mkv")
     opus_meta = media.VideoMetadata(
@@ -201,7 +202,7 @@ def test_extract_cfr_frames_maps_stream_checks_audio_packets_and_1frame_fallback
 
     # 2) Packetless .m4a after trim -> treated gracefully as audio-less!
     recorded_cmds.clear()
-    monkeypatch.setattr(media, "probe_audio_has_packets", lambda _p: False)
+    monkeypatch.setattr(media, "_probe_audio_stream_with_packets", lambda _p: None)
     _, audio_empty, _, _ = media.extract_cfr_frames(
         src, tmp_path / "out_no_pkt", start_sec=10.0, metadata=opus_meta
     )
@@ -217,11 +218,12 @@ def test_extract_cfr_frames_maps_stream_checks_audio_packets_and_1frame_fallback
 
 
 def test_build_video_writer_cmd_preserves_sar_color_no_shortest_and_lossless(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     out_mp4 = tmp_path / "out.mp4"
     audio_file = tmp_path / "audio.m4a"
     audio_file.write_bytes(b"aac")
+    monkeypatch.setattr(media, "probe_audio_has_packets", lambda path: path == audio_file)
 
     cmd = media.build_video_writer_cmd(
         641,
@@ -367,3 +369,93 @@ def test_percent_escaping_and_audio_offset_and_strict_packet_count(
 def test_run_subprocess_rejects_empty_cmd() -> None:
     with pytest.raises(ValueError):
         media.run_subprocess([])
+
+
+@pytest.mark.parametrize("colorspace, scale_name", [("bt2020nc", "bt2020"), ("bt470bg", "bt470")])
+def test_video_writer_encodes_supported_matrix_with_matching_container_tag(
+    tmp_path: Path, colorspace: str, scale_name: str,
+) -> None:
+    import shutil
+
+    output = tmp_path / "encoded.mp4"
+    ffmpeg = shutil.which("ffmpeg")
+    cmd = media.build_video_writer_cmd(
+        32, 32, 10, output, colorspace=colorspace, ffmpeg_bin=ffmpeg or "ffmpeg",
+    )
+    assert cmd[cmd.index("-vf") + 1] == f"scale=out_color_matrix={scale_name}:out_range=tv"
+    assert cmd[cmd.index("-colorspace") + 1] == colorspace
+    if ffmpeg is not None:
+        frame = bytes((160, 110, 70)) * 32 * 32
+        encoded = subprocess.run(cmd, input=frame, capture_output=True, check=False)
+        assert encoded.returncode == 0, encoded.stderr.decode()
+        assert output.stat().st_size > 0
+        if shutil.which("ffprobe"):
+            assert media.probe_video(output).colorspace == colorspace
+
+
+def test_trim_relative_to_container_start() -> None:
+    meta = media.parse_ffprobe_payload("clip.mp4", {
+        "format": {"start_time": "10.0"},
+        "streams": [
+            {"codec_type": "video", "width": 32, "height": 32, "start_time": "10.0"},
+            {"codec_type": "audio", "start_time": "11.0"},
+        ],
+    })
+    assert media.compute_audio_offset_sec(meta) == pytest.approx(1.0)
+    assert media.compute_audio_offset_sec(meta, start_sec=0.25) == pytest.approx(0.75)
+    assert media.compute_audio_offset_sec(meta, start_sec=2.0) == pytest.approx(0.0)
+
+def test_writer_omits_header_only_audio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    packetless = tmp_path / "header_only.m4a"
+    packetless.write_bytes(b"nonempty container header")
+    monkeypatch.setattr(media, "require_binary", lambda binary: binary)
+    commands = []
+
+    def ffprobe(cmd, *, check=False):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout='{"streams": [{"codec_type": "audio", "nb_read_packets": "0"}]}',
+        )
+
+    monkeypatch.setattr(media, "run_subprocess", ffprobe)
+    writer = media.build_video_writer_cmd(32, 32, 10, tmp_path / "encoded.mp4", audio_path=packetless)
+    assert commands and "-count_packets" in commands[0]
+    assert writer.count("-i") == 1
+    assert "1:a:0" not in writer and "-c:a" not in writer
+
+
+def test_extraction_reports_audio_and_video_origins_after_same_seek(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.touch()
+    meta = media.VideoMetadata(
+        path="clip.mp4", width=32, height=32, display_width=32, display_height=32,
+        rotation=0, fps=25, is_vfr=False, duration_sec=8, has_audio=True,
+        video_stream_index=0, audio_stream_index=1, audio_codec="aac",
+        format_start_time=10.0, video_start_time=10.0, audio_start_time=11.0,
+    )
+    monkeypatch.setattr(media, "require_binary", lambda binary: binary)
+
+    def run(cmd, *, check=True):
+        if cmd[0] == "ffprobe":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='{"streams": [{"codec_type":"audio","nb_read_packets":"10","start_time":"0.125"}]}',
+            )
+        assert cmd[cmd.index("-ss") + 1] == "2.000000"
+        dest = Path(cmd[-1].removeprefix("file:"))
+        if "-vn" in cmd:
+            assert cmd[cmd.index("-c:a") + 1] == "aac"
+            dest.write_bytes(b"audio")
+        else:
+            assert cmd[cmd.index("-frame_pts") + 1] == "1"
+            for pts in (2, 3):
+                dest.with_name(dest.name.replace("%06d", f"{pts:06d}")).write_bytes(str(pts).encode())
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(media, "run_subprocess", run)
+    frames, audio, measured, _ = media.extract_cfr_frames(source, tmp_path / "prep", start_sec=2, metadata=meta)
+    assert [path.name for path in frames] == ["000000.png", "000001.png"]
+    assert [path.read_bytes() for path in frames] == [b"2", b"3"]
+    assert audio is not None
+    assert media.compute_audio_offset_sec(measured, start_sec=2) == pytest.approx(0.125 - 2 / 25)

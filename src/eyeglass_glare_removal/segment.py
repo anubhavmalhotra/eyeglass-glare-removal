@@ -26,7 +26,9 @@ from eyeglass_glare_removal._runtime import (
     cuda_empty_cache_if_needed,
     cuda_peak_vram_gib,
     gpu_file_lock,
+    model_revision_kwargs,
     preferred_inference_dtype,
+    resolve_model_identity,
     resolve_torch_device,
 )
 from eyeglass_glare_removal._workspace import (
@@ -54,24 +56,6 @@ def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     inter = int((a_b & b_b).sum())
     return float(inter) / float(union)
-
-
-def _lens_pair_iou(prev_m: np.ndarray, cand_m: np.ndarray) -> tuple[float, bool]:
-    """
-    Compare a single lens mask across chunks, explicitly distinguishing mutual absence
-    (both empty during an occlusion -> `(1.0, True)`) from tracking collapse (`(0.0, False)`).
-    """
-    a_b = prev_m > 0
-    b_b = cand_m > 0
-    a_any = bool(a_b.any())
-    b_any = bool(b_b.any())
-    if not a_any and not b_any:
-        return 1.0, True
-    if not a_any or not b_any:
-        return 0.0, False
-    inter = int((a_b & b_b).sum())
-    union = int((a_b | b_b).sum())
-    return float(inter) / float(max(1, union)), False
 
 
 def compute_sam2_chunk_ranges(
@@ -594,29 +578,63 @@ def compute_glare_hotspot_mask(
     )
 
     raw = (bright_specular | broad_neutral | cool_screen | warm_lamp | green_ar | purple_ar) & inside
-    m = raw.astype(np.uint8)
-
+    _, labels = cv2.connectedComponents(inside.astype(np.uint8), connectivity=8)
+    soft = np.zeros(inside.shape, dtype=np.uint8)
     k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open)
-
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_close)
-    m = binary_fill_holes(m > 0).astype(np.uint8)
+    for label in np.unique(labels[raw]):
+        lens = labels == label
+        lens_raw = raw & lens
+        m = cv2.morphologyEx(lens_raw.astype(np.uint8), cv2.MORPH_OPEN, k_open)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_close)
+        m = binary_fill_holes(m > 0).astype(np.uint8)
+        if dilate_px > 0:
+            kd = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
+            )
+            m = cv2.dilate(m, kd)
+        lens_soft = ((m > 0) & lens).astype(np.float32) * 255.0
+        if feather_sigma > 0.0:
+            lens_soft = cv2.GaussianBlur(lens_soft, (0, 0), sigmaX=feather_sigma)
+            lens_soft[lens_raw] = 255.0
+        soft[lens] = np.clip(lens_soft[lens], 0.0, 255.0).astype(np.uint8)
+    return soft
 
-    if dilate_px > 0:
-        kd = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
-        )
-        m = cv2.dilate(m, kd, iterations=1)
 
-    m_inside = (m > 0) & inside
-    soft = m_inside.astype(np.float32) * 255.0
-    if feather_sigma > 0.0:
-        soft = cv2.GaussianBlur(soft, (0, 0), sigmaX=feather_sigma, sigmaY=feather_sigma)
-        soft = np.maximum(soft, np.where(raw, 255.0, 0.0))
+def expanded_lens_labels(mask: np.ndarray, radius: int) -> tuple[int, np.ndarray, np.ndarray]:
+    """Label original lens supports and assign each expanded pixel to its nearest support."""
+    binary = (mask > 127).astype(np.uint8)
+    count, labels = cv2.connectedComponents(binary, connectivity=8)
+    if radius <= 0 or count == 1:
+        return count, labels, labels
 
-    soft = np.where(inside, np.clip(soft, 0.0, 255.0), 0.0)
-    return soft.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    if count == 2:
+        return count, labels, cv2.dilate(binary, kernel)
+
+    owners = labels.copy()
+    distances = np.full(binary.shape, np.inf, dtype=np.float32)
+    for label in range(1, count):
+        component = (labels == label).astype(np.uint8)
+        distance = cv2.distanceTransform(1 - component, cv2.DIST_L2, 5)
+        closer = (cv2.dilate(component, kernel) > 0) & (distance < distances)
+        owners[closer] = label
+        distances[closer] = distance[closer]
+    return count, labels, owners
+
+
+def separate_lens_masks(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep tracked lens supports distinct in binary union PNGs, even when they touch."""
+    left_bin, right_bin = left > 127, right > 127
+    overlap = left_bin & right_bin
+    if overlap.any():
+        depth_l = cv2.distanceTransform(left_bin.astype(np.uint8), cv2.DIST_L2, 5)
+        depth_r = cv2.distanceTransform(right_bin.astype(np.uint8), cv2.DIST_L2, 5)
+        left_bin &= ~overlap | (depth_l > depth_r)
+        right_bin &= ~left_bin
+    contact = cv2.dilate(left_bin.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0
+    right_bin &= ~contact
+    return left_bin.astype(np.uint8) * 255, right_bin.astype(np.uint8) * 255
 
 
 def _build_init_session_kwargs(
@@ -770,57 +788,52 @@ def _evaluate_chunk_handoff(
     prev_r_ov: list[np.ndarray],
     cand_l_ov: list[np.ndarray],
     cand_r_ov: list[np.ndarray],
-    splice_i: int,
+    last_visible: tuple[np.ndarray | None, np.ndarray | None],
 ) -> dict[str, Any]:
-    """
-    Verify per-lens IoU across seed AND post-seed overlap frames (including splice_i),
-    detecting left/right identity swaps while handling mutual occlusion (both empty) cleanly.
-    """
+    """Compare visible overlap masks and corroborate identities after an occlusion."""
     ov_len = min(len(prev_l_ov), len(cand_l_ov))
-    if ov_len == 0:
-        return {
-            "iou_l": 1.0,
-            "iou_r": 1.0,
-            "splice_iou_l": 1.0,
-            "splice_iou_r": 1.0,
-            "min_iou": 1.0,
-            "swapped": False,
-        }
+    scores: list[list[float]] = [[], []]
+    swapped = False
 
-    s_idx = min(max(1 if ov_len >= 2 else 0, splice_i), ov_len - 1)
-    l_ious: list[float] = []
-    r_ious: list[float] = []
-    cross_lr: list[float] = []
-    cross_rl: list[float] = []
+    for side, (previous, other, candidate, candidate_other) in enumerate((
+        (prev_l_ov, prev_r_ov, cand_l_ov, cand_r_ov),
+        (prev_r_ov, prev_l_ov, cand_r_ov, cand_l_ov),
+    )):
+        for k in range(ov_len):
+            if previous[k].any() or candidate[k].any():
+                score = mask_iou(previous[k], candidate[k])
+                scores[side].append(score)
+                if k >= min(1, ov_len - 1):
+                    swapped |= mask_iou(other[k], candidate[k]) > score + 0.05
 
-    for k in range(ov_len):
-        li, l_both_empty = _lens_pair_iou(prev_l_ov[k], cand_l_ov[k])
-        ri, r_both_empty = _lens_pair_iou(prev_r_ov[k], cand_r_ov[k])
-        l_ious.append(li)
-        r_ious.append(ri)
-        # Only score cross-swap on non-empty lenses (two empty lenses aren't swapped!)
-        clr = 0.0 if (l_both_empty or r_both_empty) else mask_iou(prev_l_ov[k], cand_r_ov[k])
-        crl = 0.0 if (l_both_empty or r_both_empty) else mask_iou(prev_r_ov[k], cand_l_ov[k])
-        cross_lr.append(clr)
-        cross_rl.append(crl)
+        last_absent = next(
+            (k for k in range(ov_len - 1, -1, -1) if not previous[k].any() and not candidate[k].any()),
+            None,
+        )
+        if last_absent is not None:
+            for k in range(last_absent + 1, len(candidate)):
+                if not candidate[k].any():
+                    continue
+                if candidate_other[k].any():
+                    cx = np.nonzero(candidate[k])[1].mean()
+                    other_x = np.nonzero(candidate_other[k])[1].mean()
+                    crossed = cx >= other_x if side == 0 else cx <= other_x
+                else:
+                    own, opposite = (last_visible if side == 0 else last_visible[::-1])
+                    own_iou = mask_iou(own, candidate[k]) if own is not None else 0.0
+                    other_iou = mask_iou(opposite, candidate[k]) if opposite is not None else 0.0
+                    crossed = other_iou > own_iou + 0.05
+                    if max(own_iou, other_iou) == 0:
+                        continue
+                swapped |= crossed
+                scores[side].append(0.0 if crossed else 1.0)
+                break
 
-    splice_l = l_ious[s_idx]
-    splice_r = r_ious[s_idx]
-    post_start = 1 if ov_len >= 2 else 0
-
-    swapped = (
-        (cross_lr[s_idx] > splice_l + 0.05)
-        or (cross_rl[s_idx] > splice_r + 0.05)
-        or any(cross_lr[k] > l_ious[k] + 0.05 for k in range(post_start, ov_len))
-        or any(cross_rl[k] > r_ious[k] + 0.05 for k in range(post_start, ov_len))
-    )
-    min_iou = min(min(l_ious), min(r_ious))
+    combined = scores[0] + scores[1]
     return {
-        "iou_l": splice_l,
-        "iou_r": splice_r,
-        "splice_iou_l": splice_l,
-        "splice_iou_r": splice_r,
-        "min_iou": min_iou,
+        "iou_l": min(scores[0], default=0.0),
+        "iou_r": min(scores[1], default=0.0),
+        "min_iou": min(combined, default=None),
         "swapped": swapped,
     }
 
@@ -878,9 +891,10 @@ def run_chunked_tracking_loop(
     prev_tail_start: int | None = None
     prev_tail_l: list[np.ndarray] = []
     prev_tail_r: list[np.ndarray] = []
+    last_visible: tuple[np.ndarray | None, np.ndarray | None] = (None, None)
 
     min_ov = 2 if overlap > 0 else 0
-    min_chunk_len = min_ov + 2
+    min_chunk_len = min_ov + 1
     cur_chunk_size = chunk_size
     cur_overlap = overlap
     cs = 0
@@ -899,7 +913,13 @@ def run_chunked_tracking_loop(
             ov_offset = cs - prev_tail_start
             prev_l_ov = prev_tail_l[ov_offset : ov_offset + actual_ov]
             prev_r_ov = prev_tail_r[ov_offset : ov_offset + actual_ov]
-            handoff_dep_digest = _hash_overlap_masks(prev_l_ov, prev_r_ov)
+            # A lens may be absent for the entire overlap. Its last visible mask is also
+            # an input to the handoff check when it reappears by itself.
+            last_l, last_r = last_visible
+            handoff_dep_digest = _hash_overlap_masks(
+                [*prev_l_ov, last_l if last_l is not None else np.zeros_like(prev_l_ov[0])],
+                [*prev_r_ov, last_r if last_r is not None else np.zeros_like(prev_r_ov[0])],
+            )
 
         chunk_fp = f"{fingerprint}:{handoff_dep_digest}" if fingerprint else handoff_dep_digest
         ckpt_p = (
@@ -956,7 +976,6 @@ def run_chunked_tracking_loop(
                 else:
                     prev_l0 = prev_l_ov[0]
                     prev_r0 = prev_r_ov[0]
-                    splice_i = max(1 if actual_ov >= 2 else 0, actual_ov // 2)
 
                     lp, rp = derive_prompts_from_masks(
                         prev_l0, prev_r0, fallback_prompts=fallback_pair
@@ -965,16 +984,16 @@ def run_chunked_tracking_loop(
                         chunk_frames, left_prompts=lp, right_prompts=rp, init_masks=None
                     )
                     ev1 = _evaluate_chunk_handoff(
-                        prev_l_ov, prev_r_ov, c_left[:actual_ov], c_right[:actual_ov], splice_i
+                        prev_l_ov, prev_r_ov, c_left, c_right, last_visible
                     )
 
-                    if ev1["swapped"] or ev1["min_iou"] < handoff_iou_threshold:
+                    if ev1["swapped"] or (ev1["min_iou"] is not None and ev1["min_iou"] < handoff_iou_threshold):
                         logger.warning(
                             "Chunk %d box+pts handoff failed (swapped=%s, min_iou=%.3f < %.2f); "
                             "retrying with input_masks.",
                             c_idx,
                             ev1["swapped"],
-                            ev1["min_iou"],
+                            ev1["min_iou"] if ev1["min_iou"] is not None else 0.0,
                             handoff_iou_threshold,
                         )
                         fb_left, fb_right = chunk_runner(
@@ -987,12 +1006,12 @@ def run_chunked_tracking_loop(
                             ),
                         )
                         ev2 = _evaluate_chunk_handoff(
-                            prev_l_ov, prev_r_ov, fb_left[:actual_ov], fb_right[:actual_ov], splice_i
+                            prev_l_ov, prev_r_ov, fb_left, fb_right, last_visible
                         )
 
                         candidates = [
-                            (not ev1["swapped"], ev1["min_iou"], False, c_left, c_right, ev1),
-                            (not ev2["swapped"], ev2["min_iou"], True, fb_left, fb_right, ev2),
+                            (not ev1["swapped"], ev1["min_iou"] if ev1["min_iou"] is not None else 1.0, False, c_left, c_right, ev1),
+                            (not ev2["swapped"], ev2["min_iou"] if ev2["min_iou"] is not None else 1.0, True, fb_left, fb_right, ev2),
                         ]
                         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
                         best_non_swapped, best_min_iou, best_fb, c_left, c_right, best_ev = (
@@ -1081,6 +1100,10 @@ def run_chunked_tracking_loop(
             }
         )
 
+        last_visible = (
+            next((mask for mask in reversed(c_left) if mask.any()), last_visible[0]),
+            next((mask for mask in reversed(c_right) if mask.any()), last_visible[1]),
+        )
         prev_end = ce
         keep_tail = min(chunk_len, max(1, cur_overlap))
         prev_tail_start = ce - keep_tail
@@ -1285,12 +1308,21 @@ def render_mask_overlay_grid(
         raise
 
 
+def resolve_segment_identity(config: SegmentConfig, torch: Any) -> tuple[Any, Any, str]:
+    device = resolve_torch_device(torch, config.device)
+    dtype = preferred_inference_dtype(torch, device)
+    model = resolve_model_identity(config.model_id, ("config.json",))
+    return device, dtype, model
+
+
 def compute_segment_generation(
     roi_frames_digest: str,
     seed_idx: int,
     init_left: dict[str, Any],
     init_right: dict[str, Any],
     config: SegmentConfig,
+    *,
+    runtime_identity: tuple[str, ...] = (),
 ) -> tuple[str, str]:
     """Return `(sam2_generation, segment_generation)` bound to live ROI bytes & all behavior configs."""
     sam2_payload = json.dumps(
@@ -1298,6 +1330,7 @@ def compute_segment_generation(
             "roi_frames_digest": roi_frames_digest,
             "model_id": config.model_id,
             "device": config.device,
+            "runtime_identity": runtime_identity,
             "seed_idx": seed_idx,
             "init_left": init_left,
             "init_right": init_right,
@@ -1372,13 +1405,13 @@ def run_segment_stage(
         roi_size=roi_size,
         override_prompts=config.lens_points,
     )
-    sam2_gen, seg_gen = compute_segment_generation(
-        live_roi_digest, seed_idx, init_left, init_right, config
-    )
-
     configure_sdpa_guard(torch)
-    device = resolve_torch_device(torch, config.device)
-    dtype = preferred_inference_dtype(torch, device)
+    device, dtype, model_identity = resolve_segment_identity(config, torch)
+    runtime_identity = (str(device), str(dtype), model_identity, torch.__version__)
+    sam2_gen, seg_gen = compute_segment_generation(
+        live_roi_digest, seed_idx, init_left, init_right, config, runtime_identity=runtime_identity
+    )
+    revision = model_revision_kwargs(model_identity)
 
     # Keep resumable SAM2 chunk checkpoints in a sibling dir so masks_root commits atomically as one unit
     ckpt_dir = ensure_confined_dir(
@@ -1403,9 +1436,9 @@ def run_segment_stage(
             init_masks: tuple[np.ndarray, np.ndarray] | None,
         ) -> tuple[list[np.ndarray], list[np.ndarray]]:
             if sam_state["model"] is None:
-                sam_state["processor"] = Sam2VideoProcessor.from_pretrained(config.model_id)
+                sam_state["processor"] = Sam2VideoProcessor.from_pretrained(config.model_id, **revision)
                 sam_state["model"] = (
-                    Sam2VideoModel.from_pretrained(config.model_id, dtype=dtype)
+                    Sam2VideoModel.from_pretrained(config.model_id, dtype=dtype, **revision)
                     .to(device)
                     .eval()
                 )
@@ -1510,6 +1543,8 @@ def run_segment_stage(
                 raise FileNotFoundError(f"Missing ROI frame: {roi_fp}")
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
+            lc_i, rc_i = separate_lens_masks(lc_i, rc_i)
+            le_i, re_i = separate_lens_masks(le_i, re_i)
             lens_roi = np.maximum(lc_i, rc_i)
             exact_roi = np.maximum(le_i, re_i)
             glare_roi = compute_glare_hotspot_mask(

@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,9 @@ from eyeglass_glare_removal._runtime import (
     cuda_empty_cache_if_needed,
     cuda_peak_vram_gib,
     gpu_file_lock,
+    model_revision_kwargs,
     preferred_inference_dtype,
+    resolve_model_identity,
     resolve_torch_device,
 )
 from eyeglass_glare_removal._workspace import (
@@ -39,6 +42,7 @@ from eyeglass_glare_removal._workspace import (
     verify_image_file,
 )
 from eyeglass_glare_removal.config import InpaintConfig
+from eyeglass_glare_removal.segment import expanded_lens_labels
 
 logger = logging.getLogger(__name__)
 
@@ -169,16 +173,12 @@ def compute_run_fingerprint(
     ref_paths: list[Path] | None,
     *,
     inputs_digest: str = "",
+    runtime_identity: tuple[str, ...] = (),
+    reference_digests: list[str] | None = None,
 ) -> str:
     """Stable hash of upstream input bytes + reference image bytes + all effective inpaint configs."""
-    ref_part = "no_ref"
-    if ref_paths:
-        h_ref = hashlib.sha256()
-        for rp in ref_paths:
-            h_ref.update(str(rp.name).encode("utf-8"))
-            if rp.exists():
-                h_ref.update(hash_file_sha256(rp).encode("ascii"))
-        ref_part = h_ref.hexdigest()[:24]
+    if reference_digests is None:
+        reference_digests = [hash_file_sha256(path) for path in (ref_paths or []) if path.exists()]
     payload = json.dumps(
         {
             "inputs_digest": inputs_digest,
@@ -186,6 +186,7 @@ def compute_run_fingerprint(
             "text_encoder_model_id": config.text_encoder_model_id,
             "quantize_4bit": config.quantize_4bit,
             "device": config.device,
+            "runtime_identity": runtime_identity,
             "size": config.size,
             "chunk_len": config.chunk_len,
             "min_overlap": config.min_overlap,
@@ -198,7 +199,7 @@ def compute_run_fingerprint(
             "prompt": config.prompt,
             "neg_prompt": config.neg_prompt,
             "seed": config.seed,
-            "ref_hash": ref_part,
+            "reference_digests": reference_digests,
         },
         sort_keys=True,
     )
@@ -224,11 +225,11 @@ def is_chunk_complete(
         meta = json.loads(done_file.read_text(encoding="utf-8"))
         if not isinstance(meta, dict):
             return False
-        if meta.get("num_frames") != expected_len:
+        if type(meta.get("num_frames")) is not int or meta["num_frames"] != expected_len:
             return False
-        if expected_start is not None and meta.get("start") != expected_start:
+        if expected_start is not None and (type(meta.get("start")) is not int or meta["start"] != expected_start):
             return False
-        if expected_end is not None and meta.get("end") != expected_end:
+        if expected_end is not None and (type(meta.get("end")) is not int or meta["end"] != expected_end):
             return False
         if expected_fingerprint is not None and meta.get("config_fingerprint") != expected_fingerprint:
             return False
@@ -275,23 +276,27 @@ def prep_frame_and_mask(
         mask_im = mask_im.resize((size, size), Image.Resampling.NEAREST)
     m_arr = (np.asarray(mask_im) > 127).astype(np.uint8) * 255
 
+    kernel = None
     if mask_dilate > 0:
-        k = cv2.getStructuringElement(
+        kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * mask_dilate + 1, 2 * mask_dilate + 1)
         )
-        m_arr = cv2.dilate(m_arr, k, iterations=1)
 
     if clamp_mask_path is not None and clamp_mask_path.exists():
         cm = Image.open(clamp_mask_path).convert("L")
         if cm.size != (size, size):
             cm = cm.resize((size, size), Image.Resampling.NEAREST)
-        cm_arr = (np.asarray(cm) > 127).astype(np.uint8) * 255
-        if clamp_dilate > 0:
-            kc = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (2 * clamp_dilate + 1, 2 * clamp_dilate + 1)
-            )
-            cm_arr = cv2.dilate(cm_arr, kc, iterations=1)
-        m_arr = np.where(cm_arr > 127, m_arr, 0).astype(np.uint8)
+        count, _, owners = expanded_lens_labels(np.asarray(cm), clamp_dilate)
+        clamped = np.zeros_like(m_arr)
+        for label in range(1, count):
+            lens = owners == label
+            glare = np.where(lens, m_arr, 0)
+            if kernel is not None:
+                glare = cv2.dilate(glare, kernel)
+            clamped[lens] = glare[lens]
+        m_arr = clamped
+    elif kernel is not None:
+        m_arr = cv2.dilate(m_arr, kernel)
 
     glare_px = int((m_arr > 127).sum())
     rgb = np.asarray(img, dtype=np.uint8).copy()
@@ -383,38 +388,7 @@ def stream_blend_chunks(
 
 
 def _resolve_text_encoder_revision(text_model_id: str) -> str:
-    """Resolve an offline-safe encoder revision/config digest for prompt-embedding cache keying."""
-    p = Path(text_model_id)
-    if p.exists() and p.is_dir():
-        h = hashlib.sha256()
-        found_any = False
-        for rel in (
-            "text_encoder/config.json",
-            "config.json",
-            "tokenizer/tokenizer_config.json",
-            "tokenizer_config.json",
-            "model_index.json",
-        ):
-            fp = p / rel
-            if fp.is_file() and not fp.is_symlink():
-                h.update(rel.encode("utf-8"))
-                h.update(hash_file_sha256(fp).encode("ascii"))
-                found_any = True
-        if found_any:
-            return f"local:{h.hexdigest()[:16]}"
-
-    try:
-        from huggingface_hub import try_to_load_from_cache
-
-        for fname in ("text_encoder/config.json", "config.json", "model_index.json"):
-            cached = try_to_load_from_cache(text_model_id, fname)
-            if isinstance(cached, str) and "/snapshots/" in cached:
-                snap = cached.split("/snapshots/", 1)[1].split("/", 1)[0]
-                if snap:
-                    return f"hf:{snap}"
-    except Exception:
-        pass
-    return "default"
+    return resolve_model_identity(text_model_id, ("text_encoder/config.json", "config.json", "model_index.json"))
 
 
 def compute_embed_cache_key(
@@ -425,6 +399,8 @@ def compute_embed_cache_key(
     encoder_revision: str = "default",
     max_sequence_length: int = _DEFAULT_VACE_SEQ_LEN,
     dtype_str: str = "torch.bfloat16",
+    device_str: str = "",
+    torch_version: str = "",
     expected_hidden_dim: int = _DEFAULT_VACE_HIDDEN_DIM,
 ) -> str:
     """Collision-free structured JSON hash key for cached prompt embeddings."""
@@ -436,6 +412,8 @@ def compute_embed_cache_key(
             "neg_prompt": neg_prompt,
             "max_sequence_length": int(max_sequence_length),
             "dtype": str(dtype_str),
+            "device": device_str,
+            "torch_version": torch_version,
             "expected_hidden_dim": int(expected_hidden_dim),
         },
         sort_keys=True,
@@ -512,19 +490,21 @@ def load_prompt_embeds_safetensors(
     return pe, npe
 
 
-def _load_text_encoder_pipeline(text_model_id: str, dtype: Any) -> Any:
+def _load_text_encoder_pipeline(text_model_id: str, dtype: Any, identity: str | None = None) -> Any:
     """
     Load UMT5 tokenizer & encoder from EITHER a full Diffusers repo (`model_index.json`) OR
     a standalone Hugging Face UMT5 repository (`config.json` + tokenizer assets).
     """
     from diffusers import WanVACEPipeline
 
+    revision = model_revision_kwargs(identity)
     try:
         return WanVACEPipeline.from_pretrained(
             text_model_id,
             transformer=None,
             vae=None,
             torch_dtype=dtype,
+            **revision,
         )
     except (OSError, ValueError) as exc:
         logger.info(
@@ -532,8 +512,8 @@ def _load_text_encoder_pipeline(text_model_id: str, dtype: Any) -> Any:
         )
         from transformers import AutoTokenizer, UMT5EncoderModel
 
-        tokenizer = AutoTokenizer.from_pretrained(text_model_id)
-        text_encoder = UMT5EncoderModel.from_pretrained(text_model_id, torch_dtype=dtype)
+        tokenizer = AutoTokenizer.from_pretrained(text_model_id, **revision)
+        text_encoder = UMT5EncoderModel.from_pretrained(text_model_id, torch_dtype=dtype, **revision)
         return WanVACEPipeline(
             tokenizer=tokenizer,
             text_encoder=text_encoder,
@@ -543,12 +523,12 @@ def _load_text_encoder_pipeline(text_model_id: str, dtype: Any) -> Any:
         )
 
 
-def _resolve_expected_text_dim(model_id: str) -> int:
+def _resolve_expected_text_dim(model_id: str, identity: str | None = None) -> int:
     """Query transformer `text_dim` from config without downloading weights (fallback 4096)."""
     try:
         from diffusers import WanVACETransformer3DModel
 
-        cfg = WanVACETransformer3DModel.load_config(model_id, subfolder="transformer")
+        cfg = WanVACETransformer3DModel.load_config(model_id, subfolder="transformer", **model_revision_kwargs(identity))
         if isinstance(cfg, dict) and isinstance(cfg.get("text_dim"), int) and cfg["text_dim"] > 0:
             return int(cfg["text_dim"])
     except Exception:
@@ -566,6 +546,7 @@ def get_or_compute_prompt_embeds(
     *,
     max_sequence_length: int = _DEFAULT_VACE_SEQ_LEN,
     expected_hidden_dim: int = _DEFAULT_VACE_HIDDEN_DIM,
+    encoder_identity: str | None = None,
 ) -> tuple[Any, Any]:
     """
     Stage 1 of 2-stage VRAM-safe VACE loading: compute UMT5 prompt embeddings,
@@ -576,11 +557,14 @@ def get_or_compute_prompt_embeds(
     cache_dir = Path(cache_dir)
     reject_symlink_path(cache_dir, "embed_cache_dir")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    encoder_identity = encoder_identity or _resolve_text_encoder_revision(text_model_id)
     key = compute_embed_cache_key(
         text_model_id,
         prompt,
         neg_prompt,
-        encoder_revision=_resolve_text_encoder_revision(text_model_id),
+        encoder_revision=encoder_identity,
+        device_str=str(device),
+        torch_version=torch.__version__,
         max_sequence_length=max_sequence_length,
         dtype_str=str(dtype),
         expected_hidden_dim=expected_hidden_dim,
@@ -598,7 +582,7 @@ def get_or_compute_prompt_embeds(
         return cached
 
     logger.info("Encoding prompt with UMT5 (%s)...", text_model_id)
-    pipe_txt = _load_text_encoder_pipeline(text_model_id, dtype)
+    pipe_txt = _load_text_encoder_pipeline(text_model_id, dtype, encoder_identity)
     pipe_txt.text_encoder.to(device)
     with torch.inference_mode():
         pe, npe = pipe_txt.encode_prompt(
@@ -663,6 +647,7 @@ def load_vace_denoiser(
     device: Any,
     dtype: Any,
     flow_shift: float = 3.0,
+    model_identity: str | None = None,
 ) -> Any:
     """Stage 2 of 2-stage loading: load AutoencoderKLWan (fp32) + WanVACETransformer3DModel."""
     import torch
@@ -673,16 +658,19 @@ def load_vace_denoiser(
     )
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
+    if device.type == "cuda" and device.index is None:
+        device = resolve_torch_device(torch, "cuda")
+        dtype = preferred_inference_dtype(torch, device)
     _validate_quantization_prereqs(quantize_4bit, device, dtype)
+    revision = model_revision_kwargs(model_identity)
 
     vae = AutoencoderKLWan.from_pretrained(
-        model_id, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True
+        model_id, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True, **revision
     ).to(device)
 
     if quantize_4bit:
         from diffusers import BitsAndBytesConfig
 
-        dev_idx = device.index if device.index is not None else 0
         nf4 = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -693,8 +681,9 @@ def load_vace_denoiser(
             subfolder="transformer",
             quantization_config=nf4,
             torch_dtype=dtype,
-            device_map={"": dev_idx},
+            device_map={"": device.index},
             low_cpu_mem_usage=True,
+            **revision,
         )
     else:
         transformer = WanVACETransformer3DModel.from_pretrained(
@@ -702,9 +691,10 @@ def load_vace_denoiser(
             subfolder="transformer",
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
+            **revision,
         ).to(device)
 
-    scheduler = UniPCMultistepScheduler.from_pretrained(model_id, subfolder="scheduler")
+    scheduler = UniPCMultistepScheduler.from_pretrained(model_id, subfolder="scheduler", **revision)
     scheduler = UniPCMultistepScheduler.from_config(scheduler.config, flow_shift=flow_shift)
 
     return WanVACEPipeline(
@@ -714,6 +704,12 @@ def load_vace_denoiser(
         transformer=transformer,
         scheduler=scheduler,
     )
+
+
+def _has_glare_mask(mask_dir: Path, filename: str) -> bool:
+    path = ensure_safe_child_file(mask_dir, filename)
+    with Image.open(path) as mask:
+        return mask.convert("L").getextrema()[1] > 127
 
 
 def run_inpaint_chunks(
@@ -730,6 +726,7 @@ def run_inpaint_chunks(
     segment_generation: str | None = None,
     roi_frames_digest: str | None = None,
     masks_digest: str | None = None,
+    workspace_reference: bool = False,
 ) -> dict[str, Any]:
     """
     Execute Stage 4 resumable chunked inpainting + raised-cosine overlap blending.
@@ -754,16 +751,43 @@ def run_inpaint_chunks(
     with Image.open(frame_paths[0]) as im0:
         orig_sz = im0.size
 
-    valid_refs = [Path(p) for p in (ref_image_paths or []) if Path(p).exists()]
+    reference_assets = [Path(path).read_bytes() for path in (ref_image_paths or [])]
+    if workspace_reference and len(reference_assets) != 1:
+        raise ValueError("A managed reference must contain exactly one image.")
+    reference_digests = [hashlib.sha256(data).hexdigest() for data in reference_assets]
     ref_pils: list[Image.Image] | None = None
-    if valid_refs:
-        ref_pils = [
-            Image.open(rp).convert("RGB").resize((config.size, config.size), Image.Resampling.LANCZOS)
-            for rp in valid_refs
-        ]
+    if reference_assets:
+        ref_pils = []
+        for data in reference_assets:
+            with Image.open(BytesIO(data)) as ref:
+                ref_pils.append(ref.convert("RGB").resize(
+                    (config.size, config.size), Image.Resampling.LANCZOS
+                ))
 
     inputs_digest = compute_inputs_digest(frame_paths, mask_dir, clamp_mask_dir)
-    fingerprint = compute_run_fingerprint(config, valid_refs or None, inputs_digest=inputs_digest)
+    runtime_identity: tuple[str, ...] = ("custom",) if chunk_infer_fn is not None else ()
+    device = dtype = model_identity = encoder_identity = None
+    encoder_model = config.text_encoder_model_id or config.model_id
+    # Clean clips and injected test runners never load the model.
+    if chunk_infer_fn is None and any(
+        _has_glare_mask(mask_dir, p.name)
+        for p in frame_paths
+    ):
+        import torch
+
+        device = resolve_torch_device(torch, config.device)
+        dtype = preferred_inference_dtype(torch, device)
+        model_identity = resolve_model_identity(
+            config.model_id, ("transformer/config.json", "model_index.json")
+        )
+        encoder_identity = (
+            model_identity if encoder_model == config.model_id else _resolve_text_encoder_revision(encoder_model)
+        )
+        runtime_identity = (str(device), str(dtype), model_identity, encoder_identity, torch.__version__)
+    fingerprint = compute_run_fingerprint(
+        config, None, inputs_digest=inputs_digest, runtime_identity=runtime_identity,
+        reference_digests=reference_digests,
+    )
 
     pending = [
         ci
@@ -803,18 +827,17 @@ def run_inpaint_chunks(
             import torch
 
             configure_sdpa_guard(torch)
-            device = resolve_torch_device(torch, config.device)
-            dtype = preferred_inference_dtype(torch, device)
+            assert device is not None and dtype is not None
             # Validate native CUDA NF4 backend BEFORE allocating UMT5 or VAE!
             _validate_quantization_prereqs(config.quantize_4bit, device, dtype)
 
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
 
-            expected_dim = _resolve_expected_text_dim(config.model_id)
+            expected_dim = _resolve_expected_text_dim(config.model_id, model_identity)
             cache_dir = config.embed_cache_dir or (inpaint_dir / "embed_cache")
             pe_cpu, npe_cpu = get_or_compute_prompt_embeds(
-                config.text_encoder_model_id or config.model_id,
+                encoder_model,
                 config.prompt,
                 config.neg_prompt,
                 cache_dir,
@@ -822,6 +845,7 @@ def run_inpaint_chunks(
                 dtype,
                 max_sequence_length=_DEFAULT_VACE_SEQ_LEN,
                 expected_hidden_dim=expected_dim,
+                encoder_identity=encoder_identity,
             )
             pipe = load_vace_denoiser(
                 config.model_id,
@@ -829,6 +853,7 @@ def run_inpaint_chunks(
                 device=device,
                 dtype=dtype,
                 flow_shift=config.flow_shift,
+                model_identity=model_identity,
             )
             # Final defense-in-depth check against loaded transformer text_dim
             actual_dim = getattr(getattr(pipe, "transformer", None), "config", None)
@@ -1019,9 +1044,9 @@ def run_inpaint_chunks(
         meta = json.loads(
             (chunks_root / f"chunk_{ci:04d}" / "done.json").read_text(encoding="utf-8")
         )
-        chunk_flags = meta.get("frame_has_edit") or [True] * (e - s)
+        chunk_flags = meta["frame_has_edit"]
         for li in range(e - s):
-            if bool(chunk_flags[li]):
+            if chunk_flags[li]:
                 frame_has_edit_global[s + li] = True
 
     stage_roi_dir, cleaned_roi_digest = _stage_blend_chunks(
@@ -1043,6 +1068,8 @@ def run_inpaint_chunks(
         "cleaned_roi_digest": cleaned_roi_digest,
         "num_frames": n,
         "frame_has_edit": frame_has_edit_global,
+        "reference_digests": reference_digests,
+        "workspace_reference": workspace_reference,
     }
     summary = {
         "model_id": config.model_id,
@@ -1063,7 +1090,9 @@ def run_inpaint_chunks(
         "chunks_total": len(chunks),
         "chunks_resumed": len(chunks) - len(pending),
         "chunks_skipped_zero_glare": skipped_zero_glare_count,
-        "used_reference": bool(valid_refs),
+        "used_reference": bool(reference_assets),
+        "reference_digests": reference_digests,
+        "workspace_reference": workspace_reference,
         "peak_vram_gib": round(peak_vram_gb, 2),
         "total_wall_min": round((time.time() - t_wall0) / 60.0, 2),
         "out_roi_dir": str(out_roi_dir),
