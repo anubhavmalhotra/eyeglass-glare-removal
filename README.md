@@ -156,16 +156,47 @@ You can also invoke the CLI via `python -m eyeglass_glare_removal ...`.
 
 ## Hardware Requirements
 
-| Stage | Default Model | Peak VRAM (approx.) | Notes |
+| Stage | Default Model | Peak VRAM (measured) | Notes |
 | --- | --- | --- | --- |
 | Stage 1 (`prep`) | MediaPipe / OpenCV Haar | CPU only | Multi-threaded ROI export |
-| Stage 2 (`segment`) | `facebook/sam2.1-hiera-large` | ~5–6 GiB | Chunked (`--sam2-chunk-size 280`) keeps VRAM bounded on arbitrarily long videos |
+| Stage 2 (`segment`) | `facebook/sam2.1-hiera-large` | ~4.9 GiB (150f) / ~8.9 GiB (280f chunks) | Chunked (`--sam2-chunk-size 280`) keeps VRAM flat on arbitrarily long videos |
 | Stage 3 (`reference`) | CPU photometric scan | CPU only | Automatic clean-eye selection / stitching / mirroring |
-| Stage 4 (`inpaint`) | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | ~14–16 GiB (bf16) / ~10–12 GiB (`--quantize-4bit`) | 2-stage UMT5 precompute+unload avoids holding text encoder + DiT simultaneously |
+| Stage 4 (`inpaint`) | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | ~10.2 GiB (bf16) | 2-stage UMT5 precompute+unload avoids holding text encoder + DiT simultaneously (`--quantize-4bit` available for 14B models) |
 | Stage 5 (`composite`) | OpenCV + ffmpeg pipe | CPU only, O(1) RAM | Streams RGB24 directly to `ffmpeg` without writing full-res intermediate PNGs |
 
-- Larger models (e.g., `Wan-AI/Wan2.1-VACE-14B-diffusers`) are supported via `--vace-model` (typically combined with `--quantize-4bit` on high-VRAM GPUs).
+- Larger models (e.g., `Wan-AI/Wan2.1-VACE-14B-diffusers`) are supported via `--vace-model` (typically combined with `--quantize-4bit` on 16+ GiB GPUs).
 - CPU and Apple Silicon MPS devices are detected cleanly via `--device auto|cpu|mps`, though Stage 2 and Stage 4 are significantly faster on CUDA GPUs.
+
+---
+
+## Raw Performance Benchmarks
+
+All measurements below were collected on **NVIDIA DGX Spark** (GB10 Blackwell `sm_121`, ARM64 `aarch64`, 20-core Grace CPU, CUDA `13.0`, PyTorch `2.12.0+cu130`, `diffusers 0.37.0`, `transformers 4.57.6`, `ffmpeg 6.1.1`) using a **`576×1024` portrait @ 30 fps CFR** talking-head video with `512×512` stabilized eye ROIs and both dense white screen glare and warm lamp reflections.
+
+### End-to-End Full Video (`87.3s` / `2,619` frames)
+
+| Stage | Configuration | Wall Time | Throughput | Peak VRAM | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| Stage 1 (`prep`) | CFR decode + ROI track + PNG export (CPU) | `24.7s` | `106.0 fps` | `0 GiB` | A/V sync offset `3.0 ms` before encode |
+| Stage 2 (`segment`) | `SAM2.1-hiera-large`, 10 chunks × 280f (overlap 10) | `467.6s` (`7.79m`) | `5.60 fps` (`42.2–42.7s`/chunk) | `8.90 GiB` | `0/2,619` tracking anomalies; chunk handoff IoU `0.941–0.985` |
+| Stage 4 (`inpaint`) | `Wan2.1-VACE-1.3B` BF16, 25 steps, CFG 5.0, 38 chunks × 81f (stride 69, 12f overlap) | `183.61m` infer + `39.6s` blend (`184.27m` / `3.07h`) | `289.44s` avg / 81f chunk (`4.21s`/out frame) | `10.24 GiB` | Flat VRAM across all 38 chunks (zero leak) |
+| Stage 5 (`composite`) | Zero-outline rim-safe stream + H.264 CRF 16 `+faststart` + compare MP4 + QA grid (8 CPU workers) | `29.0s` | `94.5 fps` | `0 GiB` | O(1) RAM pipe |
+
+**Verified output & temporal quality metrics (`87.300s` / `2,619` frames):**
+- Output MP4: `21.73 MiB` (`2.01 Mbps` H.264 High `yuv420p`, `moov` at byte 32, AAC `44.1 kHz`, A/V sync delta `17.0 ms`, `0` decode errors).
+- Lens-region temporal MAD (`0–255` RGB across `2,618` frame transitions): overall mean `2.675` / median `2.247`; 37 chunk-overlap windows mean `2.556` / median `2.162` (smoother than non-boundary `2.702`, zero seam pops).
+- Outside-lens fidelity (after H.264 CRF 16 encode): `40.8–41.7 dB` PSNR (pre-encode RGB `max_outside_diff == 0`).
+
+### 5-Second Clip & Model Bake-Off (`5.0s` / `150` frames, `512×512` ROI)
+
+| Model / Method | Precision & Settings | Peak VRAM | Measured Runtime | Per-Frame Cost | Verdict on Heavy Screen + Lamp Glare |
+| --- | --- | ---: | ---: | ---: | --- |
+| `SAM2.1-hiera-large` (segmentation) | BF16, 150f single chunk | `4.93 GiB` | `30.5s` | `0.20 s/f` (`7.2 it/s`) | Clean inner-rim tracking |
+| `StableDelight` (`yoso-delight-v0-4-base`) | FP16, 1-step | `4.50 GiB` | — (3-keyframe test) | `0.84 s/f` | Eliminated — turns lenses pitch black |
+| `WindowSeat` (`Qwen-Image-Edit-2509` + LoRA) | 4-bit NF4, 1-step | `14.98 GiB` | — (3-keyframe test) | `5.74 s/f` | Eliminated for opaque glare — cuts warm glare ~70% but leaves white screen haze |
+| **`Wan2.1-VACE-1.3B` (`glare_hotspot` + clean ref)** | **BF16, 25 steps, CFG 5.0** | **`10.24 GiB`** | **`566s` (2×81f chunks, `283.2s`/chunk)** | **`3.78 s/f`** | **Winner — removes 100% white & orange glare, preserves natural eyes & real blinks** |
+| `Wan2.1-VACE-14B` + LightX2V 4-step LoRA | 4-bit NF4, 4 steps, CFG 1.0 | `15.96 GiB` | `131s` (77f stride-2) | `1.70 s/f` | Eliminated — `CFG=1.0` drops negative prompt and repaints bright reflections |
+| `Wan2.1-VACE-14B` (undistilled, `glare_hotspot` + ref) | 4-bit NF4, 18 steps, CFG 5.0 | `15.42 GiB` | `1,641s` (2×81f chunks, `820.5s`/chunk) | `10.94 s/f` | Eliminated — `2.9×` slower than `1.3B` and introduced milky lower-lens haze |
 
 ---
 
